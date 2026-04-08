@@ -23,28 +23,19 @@ jobs:
       - name: 安装依赖
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
-
-          
-      - name: Restore Token File
-        env:
-          # 直接将 Secret 映射为环境变量
-          RAW_B64: ${{ secrets.ONEDRIVE_TOKEN_CACHE_B64 }}
-        run: |
-          # 使用 Python 读取环境变量，清洗并解码成文件
-          python -c "import os, base64; data = os.environ['RAW_B64'].strip().replace(' ', '').replace('\n', '').replace('\r', ''); f = open('o365_token.txt', 'wb'); f.write(base64.b64decode(data)); print('✅ o365_token.txt 已成功还原')"
-          ls -l o365_token.txt
+          run: pip install msal requests duckdb baostock pandas numpy tqdm python-dotenv
 
           
       - name: 运行每日任务
         env:
-          AZURE_CLIENT_ID:           ${{ secrets.AZURE_CLIENT_ID }}
-          # ONEDRIVE_TOKEN_CACHE_B64:  ${{ secrets.ONEDRIVE_TOKEN_CACHE_B64 }}
-          ONEDRIVE_FOLDER:           ${{ secrets.ONEDRIVE_FOLDER }}
-          DB_FILENAME:               ${{ secrets.DB_FILENAME }}
-          EMAIL_USER:                ${{ secrets.EMAIL_USER }}
-          EMAIL_PASSWORD:            ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_TO:                  ${{ secrets.EMAIL_TO }}
-          SMTP_HOST:                 ${{ secrets.SMTP_HOST }}
-          SMTP_PORT:                 ${{ secrets.SMTP_PORT }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          ONEDRIVE_TOKEN_CACHE_B64: ${{ secrets.ONEDRIVE_TOKEN_CACHE_B64 }}
+          # 文件夹和库名
+          ONEDRIVE_FOLDER: "Stock"
+          DB_FILENAME: "A_stock.duckdb"
+          SMTP_HOST: "smtp.office365.com"
+          SMTP_PORT: "587"
         run: python astock_quant_system.py run
