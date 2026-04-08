@@ -25,10 +25,18 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
+          
+      - name: Restore Token File
+        # ✅ 使用 Linux 命令将 Base64 直接还原为文件，绕过所有编码歧义
+        run: |
+          echo "${{ secrets.ONEDRIVE_TOKEN_CACHE_B64 }}" | base64 -d > o365_token.txt
+          ls -l o365_token.txt
+
+          
       - name: 运行每日任务
         env:
           AZURE_CLIENT_ID:           ${{ secrets.AZURE_CLIENT_ID }}
-          ONEDRIVE_TOKEN_CACHE_B64:  ${{ secrets.ONEDRIVE_TOKEN_CACHE_B64 }}
+          # ONEDRIVE_TOKEN_CACHE_B64:  ${{ secrets.ONEDRIVE_TOKEN_CACHE_B64 }}
           ONEDRIVE_FOLDER:           ${{ secrets.ONEDRIVE_FOLDER }}
           DB_FILENAME:               ${{ secrets.DB_FILENAME }}
           EMAIL_USER:                ${{ secrets.EMAIL_USER }}
