@@ -23,19 +23,29 @@ jobs:
       - name: 安装依赖
         run: |
           pip install --upgrade pip
-          run: pip install msal requests duckdb baostock pandas numpy tqdm python-dotenv
+          pip install -r requirements.txt
 
           
       - name: 运行每日任务
         env:
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          ONEDRIVE_TOKEN_CACHE_B64: ${{ secrets.ONEDRIVE_TOKEN_CACHE_B64 }}
+          AZURE_CLIENT_ID:           ${{ secrets.AZURE_CLIENT_ID }}
+          ONEDRIVE_TOKEN_CACHE_B64:  ${{ secrets.ONEDRIVE_TOKEN_CACHE_B64 }}
+          EMAIL_USER:                ${{ secrets.EMAIL_USER }}
+          EMAIL_PASSWORD:            ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO:                  ${{ secrets.EMAIL_TO }}
+          
           # 文件夹和库名
           ONEDRIVE_FOLDER: "Stock"
           DB_FILENAME: "A_stock.duckdb"
           SMTP_HOST: "smtp.office365.com"
           SMTP_PORT: "587"
         run: python astock_quant_system.py run
+      
+      
+      - name: 上传运行日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-log-${{ github.run_number }}
+          path: "*.log"
+          retention-days: 7
