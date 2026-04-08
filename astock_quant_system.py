@@ -160,20 +160,30 @@ class OneDriveManager:
 
     def export_token_b64(self) -> str:
         """
-        将当前 token 序列化后 Base64 编码，用于写入 GitHub Secret。
-        ✅ 使用 token_backend.serialize() 而非直接读文件，
-           确保输出的是新版 MSAL 格式（不含顶层 access_token 字段）。
+        将本地 Token 文件直接读取并进行 Base64 编码，用于 GitHub Secret。
+        这是最稳健的方法，避开了 SDK 内部序列化器的版本兼容性问题。
         """
-        # 先加载以确保 token 在内存中
-        if not self.token_backend.load_token():
+        token_path = os.path.abspath(self.cfg["token_cache_file"])
+        
+        if not os.path.exists(token_path):
             raise FileNotFoundError(
-                f"未找到有效 Token。请先运行 `python script.py auth`。"
+                f"❌ 未找到 Token 文件: {token_path}\n"
+                f"   请先运行 `python astock_quant_system.py auth` 完成授权。"
             )
 
-        serialized = self.token_backend.serialize()
-        if isinstance(serialized, str):
-            serialized = serialized.encode("utf-8")
-        return base64.b64encode(serialized).decode()
+        # 直接读取文件字节流
+        with open(token_path, "rb") as f:
+            token_bytes = f.read()
+
+        # 验证一下读取的内容是否为有效的 JSON，防止把空文件发出去
+        import json
+        try:
+            json.loads(token_bytes)
+        except json.JSONDecodeError:
+            raise ValueError(f"❌ Token 文件内容损坏或不是有效的 JSON，请删除 {token_path} 后重新授权。")
+
+        # 返回 Base64 字符串
+        return base64.b64encode(token_bytes).decode("utf-8")
 
     def _get_folder(self, create: bool = True):
         self.ensure_auth()
@@ -550,8 +560,7 @@ def main_task():
 # 入口
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    # mode = sys.argv[1] if len(sys.argv) > 1 else "run"
-    mode = 'run'
+    mode = sys.argv[1] if len(sys.argv) > 1 else "run"
 
     if mode == "auth":
         # 本地首次/重新授权
@@ -565,9 +574,10 @@ if __name__ == "__main__":
         token_str = odm.export_token_b64()
         print("\n" + "=" * 60)
         print("👇 请将以下内容完整设为 GitHub Secret [ONEDRIVE_TOKEN_CACHE_B64]")
-        print("=" * 60)
+        print("\n"*3)
         print(token_str)
-        print("=" * 60 + "\n")
+        print("\n"*3)
+        print('上面全部')
 
     elif mode == "run":
         main_task()
