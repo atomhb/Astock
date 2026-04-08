@@ -1,0 +1,39 @@
+name: A股每日量化分析
+
+on:
+  schedule:
+    # 北京时间 21:00 = UTC 13:00，周一至周五
+    - cron: '0 13 * * 1-5'
+  workflow_dispatch:   # 允许手动触发
+
+jobs:
+  run-stock-analysis:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 运行每日任务
+        env:
+          AZURE_CLIENT_ID:           ${{ secrets.AZURE_CLIENT_ID }}
+          ONEDRIVE_TOKEN_CACHE_B64:  ${{ secrets.ONEDRIVE_TOKEN_CACHE_B64 }}
+          ONEDRIVE_FOLDER:           ${{ secrets.ONEDRIVE_FOLDER }}
+          DB_FILENAME:               ${{ secrets.DB_FILENAME }}
+          EMAIL_USER:                ${{ secrets.EMAIL_USER }}
+          EMAIL_PASSWORD:            ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO:                  ${{ secrets.EMAIL_TO }}
+          SMTP_HOST:                 ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:                 ${{ secrets.SMTP_PORT }}
+        run: python astock_quant_system.py run
