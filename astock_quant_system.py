@@ -75,18 +75,21 @@ CONFIG = {
 #   3. 解码后内容直接写入内存环境变量，不再落盘
 # ---------------------------------------------------------
 _b64_raw = os.getenv("ONEDRIVE_TOKEN_CACHE_B64", "").strip()
-if _b64_raw and IS_CI:
-    try:
-        _b64_clean = _b64_raw.replace("\\n", "").replace("\n", "").replace("\r", "").replace(" ", "")
-        _token_json = base64.b64decode(_b64_clean).decode("utf-8")
-        if "{" not in _token_json:
-            raise ValueError("Token 内容格式非法，不包含 JSON 特征。")
-        # 将 JSON 直接存入环境变量，供 EnvTokenBackend 读取
-        os.environ[_ENV_TOKEN_KEY] = _token_json
-        log.info("✅ Token 已注入至内存环境变量（EnvTokenBackend 模式）。")
-    except Exception as e:
-        # ✅ 只报错，绝不删文件，让后续流程自然失败并给出明确提示
-        log.error(f"❌ Token 注入失败: {e}")
+if IS_CI:
+    if not _b64_raw:
+        # 如果是 CI 环境但没拿到变量，打印明确的警告
+        log.error("❌ 诊断：GitHub Secrets 变量 'ONEDRIVE_TOKEN_CACHE_B64' 未读到，请检查 YAML 配置。")
+    else:
+        try:
+            _b64_clean = _b64_raw.replace("\\n", "").replace("\n", "").replace("\r", "").replace(" ", "")
+            _token_json = base64.b64decode(_b64_clean).decode("utf-8")
+            if "{" not in _token_json:
+                raise ValueError("解密后的内容不包含 JSON 特征")
+            
+            os.environ[_ENV_TOKEN_KEY] = _token_json
+            log.info(f"✅ Token 注入成功 (长度: {len(_token_json)} 字符)")
+        except Exception as e:
+            log.error(f"❌ Token 解码失败：{e}")
 
 
 # ---------------------------------------------------------
