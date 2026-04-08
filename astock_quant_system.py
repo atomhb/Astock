@@ -9,6 +9,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
 from O365 import Account, FileSystemTokenBackend
+from O365.utils import EnvTokenBackend
 from tqdm import tqdm
 load_dotenv()
 
@@ -20,8 +21,18 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+CN_TZ = timezone(timedelta(hours=8))
 
-CN_TZ = timezone(timedelta(hours=8))   # 北京时区 UTC+8
+# ---------------------------------------------------------
+# CI 环境检测（模块级，全局可用）
+# ---------------------------------------------------------
+IS_CI = (
+    os.getenv("CI", "").lower() in ("true", "1", "yes")
+    or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
+)
+
+# EnvTokenBackend 使用的环境变量键名
+_ENV_TOKEN_KEY = "O365_TOKEN_CACHE"
 
 
 # ---------------------------------------------------------
@@ -31,12 +42,20 @@ def _get_env(key: str, default: str = "") -> str:
     return os.getenv(key, default).strip()
 
 
+# __file__ 在 Jupyter 环境中不存在，安全降级到当前目录
+try:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _BASE_DIR = os.path.abspath(".")
+
 CONFIG = {
     "azure_client_id":  _get_env("AZURE_CLIENT_ID"),
     "onedrive_folder":  _get_env("ONEDRIVE_FOLDER", "Stock"),
     "db_filename":      _get_env("DB_FILENAME", "A_stock.duckdb"),
-    # ✅ token 文件统一放在脚本同目录下，用绝对路径
-    "token_cache_file": _get_env("TOKEN_CACHE_FILE", "o365_token.txt"),
+    # 本地 token 文件使用脚本同目录的绝对路径
+    "token_cache_file": os.path.join(
+        _BASE_DIR, _get_env("TOKEN_CACHE_FILE", "o365_token.txt")
+    ),
     "smtp_host":        _get_env("SMTP_HOST", "smtp.office365.com"),
     "smtp_port":        int(_get_env("SMTP_PORT", "587")),
     "email_user":       _get_env("EMAIL_USER"),
@@ -50,25 +69,24 @@ CONFIG = {
 
 # ---------------------------------------------------------
 # Token 注入（GitHub Actions 专用）
+# ✅ 核心修改：
+#   1. 失败时绝不删除本地文件
+#   2. CI 环境使用 EnvTokenBackend，完全绕开文件读写
+#   3. 解码后内容直接写入内存环境变量，不再落盘
 # ---------------------------------------------------------
-b64_token = os.getenv("ONEDRIVE_TOKEN_CACHE_B64", "").strip()
-if b64_token:
+_b64_raw = os.getenv("ONEDRIVE_TOKEN_CACHE_B64", "").strip()
+if _b64_raw and IS_CI:
     try:
-        # 清理换行符
-        b64_token = b64_token.replace("\\n", "").replace("\n", "").replace("\r", "").replace(" ", "")
-        token_bytes = base64.b64decode(b64_token)
-        token_text = token_bytes.decode("utf-8")
-
-        if "{" not in token_text:
+        _b64_clean = _b64_raw.replace("\\n", "").replace("\n", "").replace("\r", "").replace(" ", "")
+        _token_json = base64.b64decode(_b64_clean).decode("utf-8")
+        if "{" not in _token_json:
             raise ValueError("Token 内容格式非法，不包含 JSON 特征。")
-
-        with open(CONFIG["token_cache_file"], "w", encoding="utf-8") as f:
-            f.write(token_text)
-        log.info("✅ Token 已从 B64 环境变量成功恢复。")
+        # 将 JSON 直接存入环境变量，供 EnvTokenBackend 读取
+        os.environ[_ENV_TOKEN_KEY] = _token_json
+        log.info("✅ Token 已注入至内存环境变量（EnvTokenBackend 模式）。")
     except Exception as e:
+        # ✅ 只报错，绝不删文件，让后续流程自然失败并给出明确提示
         log.error(f"❌ Token 注入失败: {e}")
-        if os.path.exists(CONFIG["token_cache_file"]):
-            os.remove(CONFIG["token_cache_file"])
 
 
 # ---------------------------------------------------------
@@ -79,15 +97,21 @@ class OneDriveManager:
         self.cfg = cfg
         self.remote_gz_name = cfg["db_filename"] + ".gz"
 
-        # ✅ token 文件绝对路径拆分为 path + filename
-        token_abs  = os.path.abspath(cfg["token_cache_file"])
-        token_dir  = os.path.dirname(token_abs)
-        token_file = os.path.basename(token_abs)
+        if IS_CI:
+            # CI: 直接从内存环境变量加载，零文件 I/O
+            self.token_backend = EnvTokenBackend(token_env_name=_ENV_TOKEN_KEY)
+            log.info("🔧 Token 后端: EnvTokenBackend（CI 模式）")
+        else:
+            # 本地: 使用文件系统，绝对路径避免工作目录漂移
+            token_abs  = os.path.abspath(cfg["token_cache_file"])
+            token_dir  = os.path.dirname(token_abs)
+            token_file = os.path.basename(token_abs)
+            self.token_backend = FileSystemTokenBackend(
+                token_path=token_dir,
+                token_filename=token_file,
+            )
+            log.info(f"🔧 Token 后端: FileSystemTokenBackend → {token_abs}")
 
-        self.token_backend = FileSystemTokenBackend(
-            token_path=token_dir,
-            token_filename=token_file,
-        )
         self.account = Account(
             (cfg["azure_client_id"],),
             auth_flow_type="public",
@@ -96,23 +120,34 @@ class OneDriveManager:
 
     def ensure_auth(self):
         """
-        检查 Token 是否有效。
-        - GitHub Actions (CI=true) 环境下：Token 无效直接报错，不尝试交互式授权。
-        - 本地环境：弹出浏览器完成首次授权。
+        验证 Token 有效性。
+        - 本地：Token 无效则打开浏览器完成交互式授权。
+        - CI  ：Token 无效直接报错，不尝试交互。
         """
-        if self.account.is_authenticated:
+        try:
+            authenticated = self.account.is_authenticated
+        except ValueError as e:
+            # ✅ 新版 O365 对旧格式 token 文件抛 ValueError
+            # "The token you are trying to load is not valid anymore."
+            log.error(
+                f"❌ Token 文件格式已过时（O365 库升级后不再兼容旧格式）。\n"
+                f"   错误: {e}\n"
+                f"   请删除旧 token 文件后重新运行 `python script.py auth`：\n"
+                f"   rm {self.cfg['token_cache_file']}"
+            )
+            authenticated = False
+
+        if authenticated:
             log.info("✅ Token 有效，无需重新授权。")
             return
 
-        # CI 环境检测
-        is_ci = os.getenv("CI", "").lower() in ("true", "1", "yes") or \
-                os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
-
-        if is_ci:
+        if IS_CI:
             raise RuntimeError(
                 "❌ CI 环境 Token 无效或已过期！\n"
-                "请在本地执行 `python script.py auth` 重新授权，\n"
-                "再执行 `python script.py export` 更新 GitHub Secret [ONEDRIVE_TOKEN_CACHE_B64]。"
+                "请在本地执行以下步骤后更新 GitHub Secret：\n"
+                "  1. python script.py auth    ← 浏览器授权\n"
+                "  2. python script.py export  ← 复制输出字符串\n"
+                "  3. 粘贴到 GitHub Secret: ONEDRIVE_TOKEN_CACHE_B64"
             )
 
         # 本地交互式授权
@@ -121,16 +156,24 @@ class OneDriveManager:
             scopes=["Files.ReadWrite.All", "offline_access"]
         ):
             raise RuntimeError("OneDrive 授权失败，请重试。")
-        log.info("✅ 授权成功，Token 已保存至: %s", self.cfg["token_cache_file"])
+        log.info("✅ 授权成功，Token 已保存。")
 
     def export_token_b64(self) -> str:
-        path = self.cfg["token_cache_file"]
-        if not os.path.exists(path):
+        """
+        将当前 token 序列化后 Base64 编码，用于写入 GitHub Secret。
+        ✅ 使用 token_backend.serialize() 而非直接读文件，
+           确保输出的是新版 MSAL 格式（不含顶层 access_token 字段）。
+        """
+        # 先加载以确保 token 在内存中
+        if not self.token_backend.load_token():
             raise FileNotFoundError(
-                f"未找到 Token 文件: {path}\n请先运行 `python script.py auth`。"
+                f"未找到有效 Token。请先运行 `python script.py auth`。"
             )
-        with open(path, "rb") as f:
-            return base64.b64encode(f.read()).decode()
+
+        serialized = self.token_backend.serialize()
+        if isinstance(serialized, str):
+            serialized = serialized.encode("utf-8")
+        return base64.b64encode(serialized).decode()
 
     def _get_folder(self, create: bool = True):
         self.ensure_auth()
@@ -166,9 +209,7 @@ class OneDriveManager:
 
         temp_gz = local_db_path + ".gz"
 
-        # ✅ 正确方式：output= 参数接收已打开的文件句柄
-        # O365 内部用 self.con.get(url, stream=True) 完成认证+重定向，
-        # 无需访问 _cloud_data / download_url 等私有/不存在的属性
+        # ✅ 使用 O365 官方 download(output=) 接口，无需访问私有属性
         with open(temp_gz, "wb") as f:
             ok = target_item.download(output=f, chunk_size=1024 * 1024)
 
@@ -183,7 +224,6 @@ class OneDriveManager:
         os.remove(temp_gz)
         log.info(f"✅ 数据库已恢复: {local_db_path}")
         return True
-
 
     def upload_db(self, local_db_path: str):
         """压缩并上传至 OneDrive"""
@@ -206,12 +246,10 @@ class OneDriveManager:
 # 工具函数
 # ---------------------------------------------------------
 def is_trading_day(d: date) -> bool:
-    """周一至周五视为交易日（不含法定节假日精确判断）"""
     return d.weekday() < 5
 
 
 def get_db_last_date(db_path: str):
-    """返回 daily_qfq 表中最新交易日；文件或表不存在返回 None"""
     if not os.path.exists(db_path):
         return None
     try:
@@ -257,10 +295,6 @@ def _ensure_tables(db_path: str):
 # Baostock 拉取单只股票（前复权 + 后复权）
 # ---------------------------------------------------------
 def _fetch_symbol(sym: str, start_str: str, end_str: str) -> tuple[list, list]:
-    """
-    同时拉取前复权(adjustflag=2)和后复权(adjustflag=1)
-    返回 (rows_qfq, rows_hfq)
-    """
     fields = "date,open,high,low,close,volume,amount"
 
     def _pull(flag: str) -> list:
@@ -274,7 +308,7 @@ def _fetch_symbol(sym: str, start_str: str, end_str: str) -> tuple[list, list]:
             rows.append([sym] + rs.get_row_data())
         return rows
 
-    return _pull("2"), _pull("1")   # qfq, hfq
+    return _pull("2"), _pull("1")
 
 
 # ---------------------------------------------------------
@@ -297,7 +331,7 @@ def _clean_df(rows: list) -> pd.DataFrame:
 
 # ---------------------------------------------------------
 # 增量写入
-# ✅ 修复：使用 con.register() 显式注册 DataFrame，避免 DuckDB 作用域问题
+# ✅ 使用 con.register() 显式注册 DataFrame
 # ---------------------------------------------------------
 def _upsert_batch(db_path: str, batch_qfq: list[pd.DataFrame], batch_hfq: list[pd.DataFrame]):
     with duckdb.connect(db_path) as con:
@@ -390,13 +424,6 @@ def incremental_update(db_path: str) -> bool:
 # 选股策略 + HTML 邮件
 # ---------------------------------------------------------
 def run_strategy_and_email(db_path: str):
-    """
-    量化筛选 (基于 daily_qfq)：
-      - 收盘 > 20 日均线
-      - 今日量比 > 1.5（放量突破）
-      - 成交额 ≥ 3000 万（流动性过滤）
-      - 20 日动量降序，取前 15
-    """
     sql = """
     WITH base AS (
         SELECT
@@ -523,19 +550,24 @@ def main_task():
 # 入口
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "run"
+    # mode = sys.argv[1] if len(sys.argv) > 1 else "run"
+    mode = 'run'
 
     if mode == "auth":
-        # 本地首次授权（打开浏览器）
-        OneDriveManager(CONFIG).ensure_auth()
+        # 本地首次/重新授权
+        odm = OneDriveManager(CONFIG)
+        odm.ensure_auth()
         log.info("✅ 授权成功，Token 已保存。")
 
     elif mode == "export":
-        # 将 Token 导出为 Base64，用于写入 GitHub Secret
-        token_str = OneDriveManager(CONFIG).export_token_b64()
-        print("\n👇 请将以下内容完整设为 GitHub Secret [ONEDRIVE_TOKEN_CACHE_B64] 👇\n")
+        # 导出 Token → 用于 GitHub Secret
+        odm = OneDriveManager(CONFIG)
+        token_str = odm.export_token_b64()
+        print("\n" + "=" * 60)
+        print("👇 请将以下内容完整设为 GitHub Secret [ONEDRIVE_TOKEN_CACHE_B64]")
+        print("=" * 60)
         print(token_str)
-        print()
+        print("=" * 60 + "\n")
 
     elif mode == "run":
         main_task()
