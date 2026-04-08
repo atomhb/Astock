@@ -1,0 +1,7 @@
+baostock>=0.8.8
+duckdb>=0.10.0
+pandas>=2.0.0
+numpy>=1.24.0
+schedule>=1.2.0
+O365>=2.0.35
+python-dotenv>=1.0.0
