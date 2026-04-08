@@ -99,19 +99,17 @@ class OneDriveManager:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.remote_gz_name = cfg["db_filename"] + ".gz"
+        # 统一 Scopes
+        self.scopes = ["Files.ReadWrite.All", "offline_access"]
 
         if IS_CI:
-            # CI: 直接从内存环境变量加载，零文件 I/O
             self.token_backend = EnvTokenBackend(token_env_name=_ENV_TOKEN_KEY)
             log.info("🔧 Token 后端: EnvTokenBackend（CI 模式）")
         else:
-            # 本地: 使用文件系统，绝对路径避免工作目录漂移
-            token_abs  = os.path.abspath(cfg["token_cache_file"])
-            token_dir  = os.path.dirname(token_abs)
-            token_file = os.path.basename(token_abs)
+            token_abs = os.path.abspath(cfg["token_cache_file"])
             self.token_backend = FileSystemTokenBackend(
-                token_path=token_dir,
-                token_filename=token_file,
+                token_path=os.path.dirname(token_abs),
+                token_filename=os.path.basename(token_abs),
             )
             log.info(f"🔧 Token 后端: FileSystemTokenBackend → {token_abs}")
 
@@ -119,46 +117,53 @@ class OneDriveManager:
             (cfg["azure_client_id"],),
             auth_flow_type="public",
             token_backend=self.token_backend,
+            # 显式传入 scopes 帮助 refresh 逻辑
+            scopes=self.scopes 
         )
 
     def ensure_auth(self):
         """
-        验证 Token 有效性。
-        - 本地：Token 无效则打开浏览器完成交互式授权。
-        - CI  ：Token 无效直接报错，不尝试交互。
+        验证并确保 Token 可用（支持 CI 环境自动刷新）。
         """
+        # 1. 尝试从后端加载 Token 到内存
         try:
-            authenticated = self.account.is_authenticated
-        except ValueError as e:
-            # ✅ 新版 O365 对旧格式 token 文件抛 ValueError
-            # "The token you are trying to load is not valid anymore."
-            log.error(
-                f"❌ Token 文件格式已过时（O365 库升级后不再兼容旧格式）。\n"
-                f"   错误: {e}\n"
-                f"   请删除旧 token 文件后重新运行 `python script.py auth`：\n"
-                f"   rm {self.cfg['token_cache_file']}"
-            )
-            authenticated = False
+            token_loaded = self.token_backend.load_token()
+        except Exception as e:
+            log.error(f"加载 Token 失败: {e}")
+            token_loaded = False
 
-        if authenticated:
-            log.info("✅ Token 有效，无需重新授权。")
+        # 2. 检查 Access Token 是否依然有效
+        if self.account.is_authenticated:
+            log.info("✅ Access Token 有效。")
             return
 
+        # 3. 如果无效但有载入 Token，尝试使用 Refresh Token 自动刷新
+        if token_loaded:
+            log.info("🔄 Access Token 已过期，尝试自动刷新...")
+            try:
+                # O365 库的内置刷新方法
+                if self.account.connection.refresh_token():
+                    log.info("✅ Token 刷新成功。")
+                    return
+                else:
+                    log.error("❌ Token 刷新返回失败。")
+            except Exception as e:
+                log.error(f"❌ 自动刷新过程中出现异常: {e}")
+
+        # 4. 如果是 CI 环境且走到这一步，说明彻底没救了
         if IS_CI:
+            # 打印部分 Token 信息协助排查（脱敏）
+            log.error("DEBUG: EnvTokenBackend 内存内容检查:")
+            log.error(f"  - 是否载入成功: {token_loaded}")
             raise RuntimeError(
-                "❌ CI 环境 Token 无效或已过期！\n"
-                "请在本地执行以下步骤后更新 GitHub Secret：\n"
-                "  1. python script.py auth    ← 浏览器授权\n"
-                "  2. python script.py export  ← 复制输出字符串\n"
-                "  3. 粘贴到 GitHub Secret: ONEDRIVE_TOKEN_CACHE_B64"
+                "❌ CI 环境 Token 无法使用或刷新失败！\n"
+                "请检查：1. Azure 应用权限是否包含 offline_access 2. 是否在本地重新执行了 export"
             )
 
-        # 本地交互式授权
-        log.info("🔑 未发现有效 Token，启动本地交互式授权（将打开浏览器）...")
-        if not self.account.authenticate(
-            scopes=["Files.ReadWrite.All", "offline_access"]
-        ):
-            raise RuntimeError("OneDrive 授权失败，请重试。")
+        # 5. 本地环境：发起交互式授权
+        log.info("🔑 正在启动本地交互式授权...")
+        if not self.account.authenticate(scopes=self.scopes):
+            raise RuntimeError("OneDrive 授权失败。")
         log.info("✅ 授权成功，Token 已保存。")
 
     def export_token_b64(self) -> str:
