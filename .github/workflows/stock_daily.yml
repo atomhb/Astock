@@ -22,11 +22,9 @@ jobs:
           
       - name: Install TA-Lib C library
         run: |
-          tar -xzf ta-lib-0.6.4-src.tar.gz
-          cd ta-lib-0.6.4/
-          ./configure --prefix=/usr
-          make
-          sudo make install
+          wget https://github.com/ta-lib/ta-lib/releases/download/v0.6.4/ta-lib_0.6.4_amd64.deb
+          sudo dpkg -i ta-lib_0.6.4_amd64.deb
+          sudo ldconfig
           
       - name: 安装依赖
         run: |
