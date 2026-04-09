@@ -4,3 +4,9 @@ pandas
 requests
 tqdm
 python-dotenv
+numpy
+requests
+urllib3
+pytdx
+TA-Lib
+schedule
