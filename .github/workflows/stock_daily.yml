@@ -2,8 +2,8 @@ name: A股每日量化分析
 
 on:
   schedule:
-    # 北京时间 21:00 = UTC 13:00，周一至周五
-    - cron: '0 13 * * 1-5'
+    # 北京时间 19:00 = UTC 11:00，周一至周五
+    - cron: '0 11 * * 1-5'
   workflow_dispatch:   # 允许手动触发
 
 jobs:
@@ -19,28 +19,24 @@ jobs:
         with:
           python-version: '3.12'
           cache: 'pip'
-
+          
+      - name: Install TA-Lib C library
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libta-lib-dev
+          
       - name: 安装依赖
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-          
       - name: 运行每日任务
         env:
           AZURE_CLIENT_ID:           ${{ secrets.AZURE_CLIENT_ID }}
           ONEDRIVE_TOKEN_CACHE_B64:  ${{ secrets.ONEDRIVE_TOKEN_CACHE_B64 }}
-          EMAIL_USER:                ${{ secrets.EMAIL_USER }}
-          EMAIL_PASSWORD:            ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_TO:                  ${{ secrets.EMAIL_TO }}
-          
-          # 文件夹和库名
-          ONEDRIVE_FOLDER: "Stock"
-          DB_FILENAME: "A_stock.duckdb"
-          SMTP_HOST: "smtp.office365.com"
-          SMTP_PORT: "587"
-        run: python astock_quant_system.py run
-      
+
+        run: python astock.py run
       
       - name: 上传运行日志
         if: always()
