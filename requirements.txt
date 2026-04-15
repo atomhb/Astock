@@ -10,3 +10,4 @@ urllib3
 pytdx
 TA-Lib
 schedule
+matplotlib
