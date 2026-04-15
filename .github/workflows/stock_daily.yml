@@ -1,48 +1,48 @@
-# name: A股每日量化分析
+name: A股每日量化分析
 
-# on:
-#   schedule:
-#     # 北京时间 19:00 = UTC 11:00，周一至周五
-#     - cron: '0 11 * * 1-5'
-#   workflow_dispatch:   # 允许手动触发
+on:
+  schedule:
+    # 北京时间 19:00 = UTC 11:00，周一至周五
+    - cron: '0 11 * * 1-5'
+  workflow_dispatch:   # 允许手动触发
 
-# jobs:
-#   run-stock-analysis:
-#     runs-on: ubuntu-latest
+jobs:
+  run-stock-analysis:
+    runs-on: ubuntu-latest
 
-#     steps:
-#       - name: 检出代码
-#         uses: actions/checkout@v4
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
 
-#       - name: 配置 Python 3.12
-#         uses: actions/setup-python@v5
-#         with:
-#           python-version: '3.12'
-#           cache: 'pip'
+      - name: 配置 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
           
-#       - name: Install TA-Lib C library
-#         run: |
-#           wget https://github.com/ta-lib/ta-lib/releases/download/v0.6.4/ta-lib_0.6.4_amd64.deb
-#           sudo dpkg -i ta-lib_0.6.4_amd64.deb
-#           sudo ldconfig
+      - name: Install TA-Lib C library
+        run: |
+          wget https://github.com/ta-lib/ta-lib/releases/download/v0.6.4/ta-lib_0.6.4_amd64.deb
+          sudo dpkg -i ta-lib_0.6.4_amd64.deb
+          sudo ldconfig
           
-#       - name: 安装依赖
-#         run: |
-#           pip install --upgrade pip
-#           pip install -r requirements.txt
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
 
-#       - name: 运行每日任务
-#         env:
-#           AZURE_CLIENT_ID:           ${{ secrets.AZURE_CLIENT_ID }}
-#           ONEDRIVE_TOKEN_CACHE_B64:  ${{ secrets.ONEDRIVE_TOKEN_CACHE_B64 }}
-#           EMAIL_TO:                  ${{ secrets.EMAIL_TO }}
+      - name: 运行每日任务
+        env:
+          AZURE_CLIENT_ID:           ${{ secrets.AZURE_CLIENT_ID }}
+          ONEDRIVE_TOKEN_CACHE_B64:  ${{ secrets.ONEDRIVE_TOKEN_CACHE_B64 }}
+          EMAIL_TO:                  ${{ secrets.EMAIL_TO }}
 
-#         run: python astock.py run
+        run: python astock.py run
       
-#       - name: 上传运行日志
-#         if: always()
-#         uses: actions/upload-artifact@v4
-#         with:
-#           name: run-log-${{ github.run_number }}
-#           path: "*.log"
-#           retention-days: 7
+      - name: 上传运行日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-log-${{ github.run_number }}
+          path: "*.log"
+          retention-days: 7
