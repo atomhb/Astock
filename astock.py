@@ -107,9 +107,9 @@ CONFIG = {
     "email_to": _env("EMAIL_TO"),
     # 其余参数固定在程序内部，避免运行环境过多配置项
     "onedrive_folder": "Stock",
-    "cloud_db_gz_name": "CN_Stock.duckdb.gz",
-    "local_db_gz_dir": 'D:\\OneDrive - 准雀\\Stock',
-    "local_db_gz_name": 'CN_stock2026.duckdb.gz',
+    "cloud_db_gz_name": "CN_Stock2.duckdb.gz",
+    "local_db_gz_dir": None,
+    "local_db_gz_name": None,
     "tdx_local_zip_path": None,
     "bootstrap_days": 120,
     "tdx_verify_ssl": False,
