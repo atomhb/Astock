@@ -1882,7 +1882,7 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
             "name": os.path.basename(LOG_FILE),
             "contentBytes": content_bytes,
         })
-    send_email_via_graph(tm, f"📈 A股量化日报 - {target_str}", html, attachments)
+    send_email_via_graph(tm, f"📈 A股-Github-量化日报 - {target_str}", html, attachments)
 # =========================================================
 # 主流程
 # =========================================================
