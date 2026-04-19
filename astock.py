@@ -597,10 +597,13 @@ def prepare_latest_qlib_data() -> str:
         log.info(f"⬇️ 下载最新数据包: {QLIB_DATA_URL}")
         with session.get(QLIB_DATA_URL, stream=True, timeout=120) as resp:
             resp.raise_for_status()
+            total_size = int(resp.headers.get("content-length", 0))
             with open(QLIB_TAR_PATH, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
+                with tqdm(total=total_size, unit="B", unit_scale=True, desc="⬇️ 下载GitHub行情数据") as pbar:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            pbar.update(len(chunk))
     _safe_extract_tar_strip_first(QLIB_TAR_PATH, QLIB_DATA_DIR)
     return QLIB_DATA_DIR
 
