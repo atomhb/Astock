@@ -74,9 +74,9 @@ CONFIG = {
     "email_to": _env("EMAIL_TO"),
     # 其余参数固定在程序内部，避免运行环境过多配置项
     "onedrive_folder": "Stock",
-    "cloud_db_gz_name": "Tu_A_stock.db.gz",
-    "local_db_gz_dir": 'D:\\OneDrive - 准雀\\Stock',
-    "local_db_gz_name": 'Tu_A_stock.db.gz',
+    "cloud_db_gz_name": "Tu_A_stock.duckdb.gz",
+    "local_db_gz_dir": None,
+    "local_db_gz_name": None,
     "bootstrap_days": 120,
     "position_cash_yuan": 50000.0,
     "take_profit_pct": 10.0,
@@ -86,7 +86,7 @@ CONFIG = {
     "adjust_cache_days": 500,
     "source_cache_ttl_seconds": 6 * 3600,
     "update_window_trade_days": 5,
-    "initial_replay_trade_days": 10,
+    "initial_replay_trade_days": 30,
     "buy_fee_rate": 0.0005,
     "sell_fee_rate": 0.0010,
 }
