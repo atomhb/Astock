@@ -27,8 +27,6 @@
 ---
 ## 📁 项目结构
 
-```text
-.
 ├── astock.py      # 🐍 主程序
 ├── requirements.txt            # 📦 Python 依赖
 
