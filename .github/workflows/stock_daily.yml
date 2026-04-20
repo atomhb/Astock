@@ -3,7 +3,7 @@ name: A股每日量化分析
 on:
   schedule:
     # 北京时间 19:00 = UTC 11:00，周一至周五
-    - cron: '30 11 * * 1-5'
+    - cron: '30 10 * * 1-5'
   workflow_dispatch:   # 允许手动触发
 
 jobs:
