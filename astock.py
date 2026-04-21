@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 1. 行情数据统一落到 stocks 表，使用 investment_data 最新发布包。
-2. 价格与金额直接使用人民币浮点值。
+2. 价格与金额直接使用人民币浮点值，不再做旧版整数缩放。
 3. 每日数据源只依赖 chenditc/investment_data（Qlib）。
 4. 前复权和后复权基于 stocks 表中的 close / adjclose 动态构建。
 5. 策略和报表直接读取 stocks / qfq / hfq 结果表。
 6. 选股信号使用前复权数据；收益率和止盈止损收益判断使用后复权数据。
-7. 动量因子 + 量能 + 布林带选股。
-8. 买入规则：T日收盘出信号，T+1 最低价 <= T日收盘价*0.985 才成交。
+7. 传统 12-1 动量因子选股。
+8. 买入规则：T日收盘出信号，T+1 最低价 <= T日收盘价*0.99 才成交。
 9. 卖出规则：跌破MA20 / 持有N天 / 止盈 / 止损。
 10. OneDrive 没有数据库时创建空库并拉取窗口行情。
 11. 日常已有数据库时执行5交易日比对增量更新。
@@ -77,21 +77,44 @@ CONFIG = {
     "cloud_db_gz_name": "Tu_A_stock.duckdb.gz",
     "local_db_gz_dir": None,
     "local_db_gz_name": None,
-    "bootstrap_days": 100,
-    "position_cash_yuan": 100000.0,
+    "bootstrap_days": 120,
+    "position_cash_yuan": 50000.0,
     "take_profit_pct": 10.0,
     "stop_loss_pct": -5.0,
     "max_hold_days": 200,
     "top_n": 20,
-    "adjust_cache_days": 200,
+    "adjust_cache_days": 320,
     "source_cache_ttl_seconds": 6 * 3600,
     "update_window_trade_days": 5,
-    "initial_replay_trade_days": 30,
+    "initial_replay_trade_days": 100,
     "buy_fee_rate": 0.0005,
     "sell_fee_rate": 0.0010,
+    "buy_pullback_pct": 0.01,
 }
 
 CONFIG["position_cash_cent"] = int(round(CONFIG["position_cash_yuan"] * 100))
+
+
+def get_buy_pullback_pct() -> float:
+    return float(CONFIG.get("buy_pullback_pct", 0.01))
+
+
+def get_buy_trigger_pct() -> float:
+    return 1.0 - get_buy_pullback_pct()
+
+
+def _format_size_mb(size_mb: float) -> str:
+    if size_mb >= 1024:
+        return f"{size_mb / 1024:.2f} GB"
+    return f"{size_mb:.1f} MB"
+
+
+def _file_size_mb(path: Optional[str]) -> float:
+    if not path or not os.path.isfile(path):
+        return 0.0
+    return os.path.getsize(path) / 1024 / 1024
+
+
 STOCKS_TABLE = "stock_prices"
 STOCK_DATE_COL = "tradedate"
 STOCK_SYMBOL_COL = "symbol"
@@ -139,7 +162,7 @@ def decode_reason_text(code) -> str:
     if code & REASON_MACD_DECREASE:
         parts.append("MACD差值减小")
     if code & REASON_BUY_T1:
-        parts.append("T+1回落1.5%成交")
+        parts.append(f"T+1回落{get_buy_pullback_pct() * 100:.1f}%成交")
     return " / ".join(parts) if parts else ""
 
 def _resolve_local_db_gz_path() -> Optional[str]:
@@ -148,6 +171,7 @@ def _resolve_local_db_gz_path() -> Optional[str]:
     if not local_dir or not local_name:
         return None
     return os.path.join(local_dir, local_name)
+
 
 LOCAL_DB_GZ_PATH = _resolve_local_db_gz_path()
 
@@ -354,12 +378,15 @@ class OneDriveClient:
 # 本地 DB ↔ OneDrive gz 工具
 # =========================================================
 _DB_GZ_NAME = CONFIG["cloud_db_gz_name"]
+_DB_GZIP_COMPRESSLEVEL = 9
 def db_compress_and_upload(odc: OneDriveClient, db_path: str, gz_path: str) -> None:
     """将 db_path 压缩为 gz_path，然后上传到 OneDrive。"""
-    with open(db_path, "rb") as fi, gzip.open(gz_path, "wb", compresslevel=6) as fo:
+    raw_size_mb = _file_size_mb(db_path)
+    with open(db_path, "rb") as fi, gzip.open(gz_path, "wb", compresslevel=_DB_GZIP_COMPRESSLEVEL) as fo:
         shutil.copyfileobj(fi, fo)
-    size_mb = os.path.getsize(gz_path) / 1024 / 1024
-    log.info(f"📦 压缩完成 {size_mb:.1f} MB → 开始上传 ...")
+    gz_size_mb = _file_size_mb(gz_path)
+    ratio = gz_size_mb / raw_size_mb * 100 if raw_size_mb > 0 else 0.0
+    log.info(f"📦 数据库 {_format_size_mb(raw_size_mb)} → {_format_size_mb(gz_size_mb)} (压缩率 {ratio:.1f}%)，开始上传 ...")
     odc.upload_database_gz(gz_path)
     log.info("☁️  数据库已上传")
 
@@ -369,10 +396,12 @@ def db_compress_to_local(db_path: str, local_gz_path: str) -> None:
     local_dir = os.path.dirname(local_gz_path)
     if local_dir:
         os.makedirs(local_dir, exist_ok=True)
-    with open(db_path, "rb") as fi, gzip.open(local_gz_path, "wb", compresslevel=6) as fo:
+    raw_size_mb = _file_size_mb(db_path)
+    with open(db_path, "rb") as fi, gzip.open(local_gz_path, "wb", compresslevel=_DB_GZIP_COMPRESSLEVEL) as fo:
         shutil.copyfileobj(fi, fo)
-    size_mb = os.path.getsize(local_gz_path) / 1024 / 1024
-    log.info(f"📦 压缩完成 {size_mb:.1f} MB → 已保存本地 {local_gz_path}")
+    gz_size_mb = _file_size_mb(local_gz_path)
+    ratio = gz_size_mb / raw_size_mb * 100 if raw_size_mb > 0 else 0.0
+    log.info(f"📦 数据库 {_format_size_mb(raw_size_mb)} → {_format_size_mb(gz_size_mb)} (压缩率 {ratio:.1f}%)，已保存本地 {local_gz_path}")
 
 
 def db_decompress_from_download(gz_path: str, db_path: str) -> None:
@@ -516,6 +545,61 @@ def drop_cache_tables(con):
     """清理临时缓存表（每次运行重建），保留策略持久表（持仓/账户/交易记录）。"""
     for t in ["daily_qfq_cache", "daily_hfq_cache"]:
         con.execute(f'DROP TABLE IF EXISTS "{t}"')
+
+
+def compact_database(con) -> None:
+    """在最终写出前回收已删除对象占用的空间。"""
+    con.execute("CHECKPOINT")
+    try:
+        con.execute("VACUUM")
+    except Exception as exc:
+        log.warning(f"⚠️ 数据库 VACUUM 失败，继续使用 CHECKPOINT 结果: {exc}")
+    con.execute("CHECKPOINT")
+
+
+def _prune_pending_orders(con, keep_rows: int = 10000) -> None:
+    rows = con.execute(
+        f"""
+        SELECT symbol, signal_date
+        FROM pending_orders
+        ORDER BY CASE WHEN status = {STATUS_PENDING} THEN 1 ELSE 0 END DESC,
+                 signal_date DESC,
+                 symbol ASC
+        """
+    ).fetchall()
+    if len(rows) <= keep_rows:
+        return
+    con.executemany(
+        "DELETE FROM pending_orders WHERE symbol=? AND signal_date=?",
+        rows[keep_rows:],
+    )
+
+
+def _prune_account_history(con, keep_rows: int = 2000) -> None:
+    rows = con.execute("SELECT date FROM account_history ORDER BY date DESC").fetchall()
+    if len(rows) <= keep_rows:
+        return
+    con.executemany(
+        "DELETE FROM account_history WHERE date=?",
+        [(row[0],) for row in rows[keep_rows:]],
+    )
+
+
+def _prune_trade_history(con, keep_trade_days: int = 5) -> None:
+    rows = con.execute(
+        "SELECT DISTINCT trade_date FROM trade_history WHERE trade_date IS NOT NULL ORDER BY trade_date DESC"
+    ).fetchall()
+    if len(rows) <= keep_trade_days:
+        return
+    con.executemany(
+        "DELETE FROM trade_history WHERE trade_date=?",
+        [(row[0],) for row in rows[keep_trade_days:]],
+    )
+
+
+def apply_history_retention(con) -> None:
+    # 只清理挂单表里的历史尾部，避免压缩后丢失交易/账户历史导致结果不一致。
+    _prune_pending_orders(con)
 
 def _migrate_db_schema(con):
     """一次性 schema 迁移: stock_prices TIMESTAMP→DATE + PRIMARY KEY + ROUND 精度。"""
@@ -1088,6 +1172,13 @@ def process_exit_rules(con, trade_date: date) -> List[Tuple]:
     holdings = con.execute("SELECT symbol, buy_date, buy_price, buy_price_hfq, shares FROM virtual_portfolio").df()
     if holdings.empty:
         return []
+    holdings["buy_date"] = pd.to_datetime(holdings["buy_date"], errors="coerce")
+    holdings = holdings[holdings["buy_date"].notna()].copy()
+    holdings["buy_date"] = holdings["buy_date"].dt.date
+    # T+1 约束：当日刚成交的买入不能在当天再次触发卖出。
+    holdings = holdings[holdings["buy_date"] < trade_date].copy()
+    if holdings.empty:
+        return []
     symbols = holdings['symbol'].tolist()
     placeholders = ','.join(['?'] * len(symbols))
     start_date = (trade_date - timedelta(days=80)).strftime('%Y-%m-%d')
@@ -1214,136 +1305,48 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
             ORDER BY symbol, date
         """, [start_date, end_date]).df()
         if df.empty:
+            apply_history_retention(con)
             return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}
         df["date"] = pd.to_datetime(df["date"])
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         picks_rows = []
+        lookback_days = 252
+        skip_days = 21
+        min_history = lookback_days + 1
         for sym, g in df.groupby("symbol"):
             g = g.sort_values("date").reset_index(drop=True)
-            if len(g) < 80:
+            if len(g) < min_history:
                 continue
+
             close = g["close"].astype(float)
-            volume = g["volume"].astype(float)
-
-            # ── 布林带计算（第一优先级过滤器）──
-            bb_period = 20
-            g["bb_mid"] = close.rolling(bb_period).mean()
-            g["bb_std"] = close.rolling(bb_period).std()
-            g["bb_upper"] = g["bb_mid"] + 2 * g["bb_std"]
-            g["bb_lower"] = g["bb_mid"] - 2 * g["bb_std"]
-            g["bb_width"] = g["bb_upper"] - g["bb_lower"]
-
-            if len(g) < 22 or pd.isna(g["bb_mid"].iloc[-1]) or pd.isna(g["bb_mid"].iloc[-2]):
-                continue
-
             last = g.iloc[-1]
-            prev = g.iloc[-2]
-
-            bb_expanding = last["bb_width"] > prev["bb_width"]   # 布林带开口
-            bb_mid_up = last["bb_mid"] > prev["bb_mid"]          # 中轨向上
-            bb_mid_not_down = last["bb_mid"] >= prev["bb_mid"]   # 中轨不向下
-
-            # 条件1: 布林带开口 + 股价沿上布林带向上（当日最低价不能大于上布林带）
-            cond_bb1 = bb_expanding and bb_mid_up and last["low"] <= last["bb_upper"]
-            # 条件2: 股价接近中轨 + 布林带趋势向上
-            cond_bb2 = (abs(last["close"] - last["bb_mid"]) / last["bb_mid"] < 0.03) and bb_mid_up
-            # 条件3: 股价跌穿下布林带 + 布林带趋势不向下
-            cond_bb3 = last["close"] <= last["bb_lower"] and bb_mid_not_down
-
-            if not (cond_bb1 or cond_bb2 or cond_bb3):
+            last_close = float(last["close"])
+            if pd.isna(last_close) or last_close <= 0:
                 continue
 
-            # ── 其他因子 ──
-            g["ret_20"] = close.pct_change(20)
-            g["ret_60"] = close.pct_change(60)
-            g["ma20"] = close.rolling(20).mean()
-            g["ma60"] = close.rolling(60).mean()
-            g["vol_ma5"] = volume.rolling(5).mean()
-            g["vol_ma20"] = volume.rolling(20).mean()
-            g["vol_ratio"] = volume / g["vol_ma20"]
-            g["up_day"] = close > close.shift(1)
-            g["vol_up"] = g["up_day"] & (volume > g["vol_ma20"])
-            g["vol_up_count_20"] = g["vol_up"].rolling(20).sum()
-
-            # MACD 趋势判断
-            macd_trend_increasing = True
-            if talib is not None:
-                _, _, macdhist = talib.MACD(close.values, fastperiod=12, slowperiod=26, signalperiod=9)
-                g["macdhist"] = macdhist
-                g["macdhist_diff"] = g["macdhist"].diff()
-                if len(g) > 30:
-                    recent_diffs = g["macdhist_diff"].iloc[-5:].values
-                    macd_trend_increasing = (sum(recent_diffs > 0) >= 3) and (g["macdhist"].iloc[-1] > g["macdhist"].iloc[-2])
-
-            if not macd_trend_increasing:
+            momentum_base = close.shift(lookback_days).iloc[-1]
+            momentum_recent = close.shift(skip_days).iloc[-1]
+            if pd.isna(momentum_base) or pd.isna(momentum_recent) or momentum_base <= 0 or momentum_recent <= 0:
                 continue
 
-            # 刷新 last（因为新增了列）
-            last = g.iloc[-1]
-            req = ["ret_20", "ret_60", "ma20", "ma60", "vol_ma5", "vol_ma20", "vol_ratio", "vol_up_count_20"]
-            if any(pd.isna(last[c]) for c in req):
-                continue
-            cond_momentum = last["ret_20"] > 0 and last["ret_60"] > 0 and last["close"] > last["ma20"] > last["ma60"]
-            cond_volume = last["vol_ratio"] > 1.2 and last["vol_ma5"] > last["vol_ma20"] and last["vol_up_count_20"] >= 3
-            if not (cond_momentum and cond_volume):
-                continue
+            momentum_12_1 = float(momentum_recent / momentum_base - 1.0)
 
-            # ── 综合评分 ──
-            momentum_score = last["ret_20"] * 40 + last["ret_60"] * 30 + ((last["close"] / last["ma20"]) - 1) * 100 * 15 + ((last["ma20"] / last["ma60"]) - 1) * 100 * 15
-            volume_score = min(last["vol_ratio"], 3.0) * 15 + min(last["vol_ma5"] / last["vol_ma20"], 2.0) * 10 + min(last["vol_up_count_20"], 10) * 2
-
-            # 布林带评分
-            boll_score = 0.0
-            if cond_bb1:
-                boll_score += 3.0  # 开口向上沿上轨
-            if cond_bb2:
-                boll_score += 2.0  # 接近中轨且趋势向上
-            if cond_bb3:
-                boll_score += 1.5  # 跌穿下轨但趋势不向下
-            if bb_expanding:
-                boll_score += 1.0  # 额外开口加分
-            boll_score = boll_score * 10.0
-
-            bull_text, bull_score, bear_text, bear_score = detect_kline_patterns(g["open"], g["high"], g["low"], g["close"])
-            pattern_score = bull_score * 10.0
-            pattern_text = bull_text
-
-            total_score = momentum_score + volume_score + boll_score + pattern_score
-            planned_buy_price = round(float(last["close"]) * 0.985, 2)
-
-            # 记录命中的布林带条件
-            bb_tags = []
-            if cond_bb1:
-                bb_tags.append("开口上行")
-            if cond_bb2:
-                bb_tags.append("中轨回踩")
-            if cond_bb3:
-                bb_tags.append("下轨支撑")
-            bb_text = " | ".join(bb_tags) if bb_tags else "—"
+            planned_buy_price = round(last_close * get_buy_trigger_pct(), 2)
+            momentum_score = round(momentum_12_1 * 100.0, 2)
 
             picks_rows.append({
                 "symbol": sym,
-                "date": last["date"].date(),
-                "close": round(float(last["close"]), 2),
+                "date": pd.to_datetime(last["date"]).date(),
+                "close": round(last_close, 2),
                 "planned_buy_price": planned_buy_price,
-                "ret_20": round(float(last["ret_20"]), 2),
-                "ret_60": round(float(last["ret_60"]), 2),
-                "ma20": round(float(last["ma20"]), 2),
-                "ma60": round(float(last["ma60"]), 2),
-                "vol_ratio": round(float(last["vol_ratio"]), 2),
-                "vol_up_count_20": float(last["vol_up_count_20"]),
-                "pattern": pattern_text,
-                "bb_condition": bb_text,
-                "momentum_score": round(momentum_score, 2),
-                "volume_score": round(volume_score, 2),
-                "boll_score": round(boll_score, 2),
-                "pattern_score": round(pattern_score, 2),
-                "total_score": round(total_score, 2),
+                "momentum_12_1": momentum_12_1,
+                "momentum_score": momentum_score,
+                "total_score": momentum_score,
             })
         df_picks = pd.DataFrame(picks_rows)
         if not df_picks.empty:
-            df_picks = df_picks.sort_values("total_score", ascending=False).head(top_n).reset_index(drop=True)
+            df_picks = df_picks.sort_values(["total_score", "momentum_12_1", "symbol"], ascending=[False, False, True]).head(top_n).reset_index(drop=True)
 
         # ── 挂单逻辑：清除旧挂单，仅从当日候选票中挂单 ──
         con.execute(f"UPDATE pending_orders SET status={STATUS_EXPIRED} WHERE status={STATUS_PENDING}")
@@ -1484,8 +1487,8 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
             "calmar": calmar,
             "chart_b64": chart_b64,
         }
-
         df_trades = con.execute("SELECT * FROM trade_history WHERE trade_date = ? ORDER BY trade_type, symbol", [target_date]).df()
+        apply_history_retention(con)
     return decode_numeric_frame(df_picks), decode_numeric_frame(df_portfolio), decode_numeric_frame(df_pending), decode_numeric_frame(df_trades), metrics
 # =========================================================
 # 报告邮件
@@ -1562,27 +1565,20 @@ def _picks_table(df: pd.DataFrame) -> str:
     max_score = float(df["total_score"].max()) if not df.empty else 1.0
     rows = []
     for i, r in enumerate(df.itertuples(), 1):
-        bb_cond = getattr(r, 'bb_condition', '—')
         rows.append(f"""
         <tr>
           <td>{i}</td>
           <td>{_market_badge(r.symbol)}</td>
           <td>¥{float(r.close):.2f}</td>
           <td>¥{float(r.planned_buy_price):.2f}</td>
-          <td>{_ret_cell(r.ret_20)}</td>
-          <td>{_ret_cell(r.ret_60)}</td>
-          <td>{r.vol_ratio:.2f}</td>
-          <td>{int(r.vol_up_count_20)}</td>
-          <td><span class="badge badge-bb">{bb_cond}</span></td>
-          <td><span class="badge badge-pending">{r.pattern}</span></td>
+                    <td>{_ret_cell(r.momentum_12_1)}</td>
           <td>{_score_bar(r.total_score, max_score)}</td>
         </tr>""")
     return f"""
     <table class="data-table">
       <thead><tr>
-        <th>#</th><th>代码</th><th>收盘价</th><th>挂单价</th>
-        <th>近20日涨幅</th><th>近60日涨幅</th><th>量比</th>
-        <th>量增天数</th><th>布林带</th><th>K线形态</th><th>综合得分</th>
+                <th>#</th><th>代码</th><th>收盘价</th><th>挂单价</th>
+                <th>12-1动量</th><th>动量得分</th>
       </tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table>"""
@@ -1786,8 +1782,8 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
 <body><div class="wrapper">
 <div class="header">
   <div class="header-left">
-    <h1>📈 A股量化日报</h1>
-    <div class="subtitle">布林带 · 动量 · 量能 三因子策略 &nbsp;|&nbsp; 前复权信号 / 后复权止盈止损</div>
+    <h1>💴( $ _ $ ) A股量化日报</h1>
+    <div class="subtitle">传统 12-1 动量因子策略 &nbsp;|&nbsp; 前复权信号 / 后复权止盈止损</div>
   </div>
   <div class="header-badge">
     <div class="date">{target_str}</div>
@@ -1841,8 +1837,8 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
     <div class="section-title">待成交挂单</div>
     <span class="section-count">{n_pending} 只</span>
   </div>
-  <p style="font-size:12px;color:#64748b;margin-bottom:14px;">
-    规则：T+1 日最低价 ≤ 挂单价时成交（收盘价 × 98.5%）</p>
+    <p style="font-size:12px;color:#64748b;margin-bottom:14px;">
+        规则：T+1 日最低价 ≤ 挂单价时成交（收盘价 × {get_buy_trigger_pct() * 100:.1f}%）</p>
   <div class="table-wrap">{_pending_table(df_pending)}</div>
 </div>
 <!-- 4. 交易记录 -->
@@ -1862,7 +1858,7 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
   </div>
   <div class="strategy-pills">
     <span class="pill">每仓资金 ¥{CONFIG['position_cash_yuan']:,.0f}</span>
-    <span class="pill buy">买入：T+1 最低价 ≤ 收盘价 × 98.5%</span>
+    <span class="pill buy">买入：T+1 最低价 ≤ 收盘价 × {get_buy_trigger_pct() * 100:.1f}%</span>
     <span class="pill sell">止盈 +{CONFIG['take_profit_pct']}%</span>
     <span class="pill sell">止损 {CONFIG['stop_loss_pct']}%</span>
     <span class="pill sell">跌破 MA20 离场</span>
@@ -1873,7 +1869,7 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
 </div>
 <div class="footer">
   <p>本报告由量化程序自动生成 · {target_str} 收盘后运行</p>
-        <p style="margin-top:4px;">数据来源：chenditc/investment_data (Qlib) · stocks 表 · 策略：布林带 + 动量 + 量能三因子 · 仅供参考，不构成投资建议</p>
+        <p style="margin-top:4px;">数据来源：chenditc/investment_data (Qlib) · stocks 表 · 策略：传统 12-1 动量因子 · 仅供参考，不构成投资建议</p>
 </div>
 </div></body></html>"""
     attachments = []
@@ -1885,7 +1881,7 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
             "name": os.path.basename(LOG_FILE),
             "contentBytes": content_bytes,
         })
-    send_email_via_graph(tm, f"📈 A股-Github-量化日报 - {target_str}", html, attachments)
+    send_email_via_graph(tm, f"📈 A股量化日报 - {target_str}", html, attachments)
 # =========================================================
 # 主流程
 # =========================================================
@@ -1982,7 +1978,10 @@ def run_daily_pipeline():
         # ── 5. 清理派生表后压缩上传（仅保留 stock_prices 以减少存储）──
         with duckdb.connect(db_path) as con:
             drop_cache_tables(con)
-            con.execute("CHECKPOINT")
+            compact_database(con)
+        final_db_size_text = _format_size_mb(_file_size_mb(db_path))
+        log.info(f"🧮 最终数据库大小: {final_db_size_text}")
+        print(f"[RUN] 最终数据库大小={final_db_size_text}", flush=True)
         if db_source == "local" and LOCAL_DB_GZ_PATH:
             db_compress_to_local(db_path, LOCAL_DB_GZ_PATH)
         else:
