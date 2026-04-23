@@ -878,88 +878,71 @@ def _normalize_dolthub_symbol(sym: str) -> str:
     return canonical_symbol(raw)
 
 
-def fetch_dolthub_csv(start_date: date, end_date: date) -> pd.DataFrame:
+def fetch_dolthub_csv(start_date: date = None, end_date: date = None) -> pd.DataFrame:
     """
-    使用 DoltHub JSON API 分页拉取 final_a_stock_eod_price 表数据。
-    字段与数据库 stock_prices 表完全一致：
-        tradedate, symbol, high, low, open, close, adjclose, volume, amount
-
-    优先使用 JSON API（/api/v1alpha1），失败后降级到 CSV 接口。
-    start_date 默认为 target_date 前 60 天，确保数据完整性且避免全量下载。
+    全量下载 DoltHub final_a_stock_eod_price 表的完整 CSV 文件。
+    - 不做时间筛选，一次性获取全部历史数据，确保数据完整性。
+    - 无 Content-Length 时以已下载字节数 + 速度展示进度条。
+    - 下载完成后在内存中解析为 DataFrame，直接写入数据库。
+    参数 start_date / end_date 保留签名兼容性，但不用于过滤请求。
     """
     session = build_retry_session()
-    start_str = start_date.strftime("%Y%m%d")   # final_a_stock_eod_price 的日期格式为 YYYYMMDD
-    end_str   = end_date.strftime("%Y%m%d")
-    log.info(f"⬇️ [DoltHub JSON API] 拉取数据: {start_str} ~ {end_str}")
+    url = "https://www.dolthub.com/csv/chenditc/investment_data/master/final_a_stock_eod_price"
+    log.info(f"⬇️ [DoltHub 全量CSV] 开始下载: {url}")
 
-    sql = (
-        f"SELECT * FROM final_a_stock_eod_price "
-        f"WHERE tradedate >= '{start_str}' AND tradedate <= '{end_str}' "
-        f"ORDER BY tradedate ASC"
-    )
-
-    all_rows: list = []
-    next_page_token: Optional[str] = None
-
-    # while True:
-    #     params: dict = {"q": sql}
-    #     if next_page_token:
-    #         params["pageToken"] = next_page_token
-    #     try:
-    #         resp = session.get(DOLTHUB_API_URL, params=params, timeout=120)
-    #         resp.raise_for_status()
-    #         data = resp.json()
-    #     except Exception as exc:
-    #         log.error(f"❌ [DoltHub JSON API] 请求失败: {exc}")
-    #         break
-
-    #     rows = data.get("rows", [])
-    #     if not rows:
-    #         break
-    #     all_rows.extend(rows)
-
-    #     next_page_token = data.get("next_page_token") or data.get("nextPageToken")
-    #     if not next_page_token:
-    #         break
-    #     log.info(f"   [DoltHub] 已获取 {len(all_rows)} 行，继续翻页 …")
-
-    # ── 降级：JSON API 失败时尝试 CSV 接口 ──
-    if not all_rows:
-        log.warning("⚠️ [DoltHub JSON API] 无数据，降级到 CSV 接口 …")
-        import urllib.parse
-        csv_sql = (
-            f"SELECT * FROM ts_a_stock_eod_price "
-            f"WHERE tradedate >= '{start_str}' AND tradedate <= '{end_str}'"
-        )
-        try:
-            resp = session.get(
-                DOLTHUB_CSV_URL,
-                params={"q": csv_sql},
-                timeout=2000,
-            )
-            resp.raise_for_status()
-            df_csv = pd.read_csv(io.StringIO(resp.text))
-            if df_csv.empty:
-                log.warning("⚠️ [DoltHub CSV] 也无数据")
-                return pd.DataFrame()
-            all_rows = df_csv.to_dict("records")
-        except Exception as exc2:
-            log.error(f"❌ [DoltHub CSV] 降级也失败: {exc2}")
-            return pd.DataFrame()
-
-    df = pd.DataFrame(all_rows)
-    if df.empty:
-        log.warning("⚠️ [DoltHub] 返回空数据")
+    try:
+        resp = session.get(url, stream=True, timeout=(15, 300))
+        resp.raise_for_status()
+    except Exception as exc:
+        log.error(f"❌ [DoltHub 全量CSV] 请求失败: {exc}")
         return pd.DataFrame()
 
-    # ── 确保必需列存在 ──
+    # Content-Length 可能不存在（流式），用 0 表示未知
+    total_size = int(resp.headers.get("Content-Length", 0))
+
+    chunks: list[bytes] = []
+    with tqdm(
+        total=total_size if total_size > 0 else None,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+        desc="⬇️ DoltHub 全量CSV",
+        dynamic_ncols=True,
+    ) as pbar:
+        for chunk in resp.iter_content(chunk_size=1024 * 512):  # 512 KB/块
+            if chunk:
+                chunks.append(chunk)
+                pbar.update(len(chunk))
+
+    raw_bytes = b"".join(chunks)
+    total_mb = len(raw_bytes) / 1024 / 1024
+    log.info(f"✅ [DoltHub 全量CSV] 下载完成，共 {total_mb:.1f} MB，开始解析 …")
+
+    try:
+        df = pd.read_csv(io.BytesIO(raw_bytes), low_memory=False)
+    except Exception as exc:
+        log.error(f"❌ [DoltHub 全量CSV] CSV 解析失败: {exc}")
+        return pd.DataFrame()
+
+    return _build_dolthub_dataframe(df.to_dict("records"), start_date, end_date)
+
+
+def _build_dolthub_dataframe(
+    all_rows: list,
+    start_date: "date | None" = None,
+    end_date: "date | None" = None,
+) -> pd.DataFrame:
+    """将 DoltHub 原始 rows 列表清洗为标准 stock_prices DataFrame。"""
+    df = pd.DataFrame(all_rows)
+    if df.empty:
+        return df
+
     required = ["tradedate", "symbol", "high", "low", "open", "close"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         log.error(f"❌ [DoltHub] 缺少必需列: {missing}，实际列={list(df.columns)}")
         return pd.DataFrame()
 
-    # adjclose / amount / volume 容错
     if "adjclose" not in df.columns:
         df["adjclose"] = df["close"]
     if "amount" not in df.columns:
@@ -967,7 +950,7 @@ def fetch_dolthub_csv(start_date: date, end_date: date) -> pd.DataFrame:
     if "volume" not in df.columns:
         df["volume"] = 0.0
 
-    # tradedate 支持 YYYYMMDD 整数字符串 或 YYYY-MM-DD 格式
+    # tradedate 兼容 YYYY-MM-DD 和 YYYYMMDD 两种格式
     df["tradedate"] = pd.to_datetime(df["tradedate"].astype(str), errors="coerce").dt.date
     df["symbol"]    = df["symbol"].map(_normalize_dolthub_symbol)
 
@@ -977,46 +960,44 @@ def fetch_dolthub_csv(start_date: date, end_date: date) -> pd.DataFrame:
 
     df = df.dropna(subset=["tradedate", "symbol", "open", "high", "low", "close", "adjclose"])
     df = df.drop_duplicates(subset=["tradedate", "symbol"], keep="last")
-    df = df[(df["tradedate"] >= start_date) & (df["tradedate"] <= end_date)]
 
-    log.info(f"✅ [DoltHub] 获取 {len(df)} 行数据，共 {df['symbol'].nunique()} 只股票")
+    # 若调用方传了日期范围则过滤（全量下载时通常不传，保留全量）
+    if start_date is not None:
+        df = df[df["tradedate"] >= start_date]
+    if end_date is not None:
+        df = df[df["tradedate"] <= end_date]
+
+    log.info(
+        f"✅ [DoltHub] 解析完成: {len(df)} 行，"
+        f"{df['symbol'].nunique()} 只股票，"
+        f"{df['tradedate'].nunique()} 个交易日"
+    )
     return df[["tradedate", "symbol", "high", "low", "open", "close", "adjclose", "volume", "amount"]].copy()
 
 
 def dolthub_sync_recent_window(db_path: str, target_date: date, trade_days: int) -> Tuple[bool, List[date]]:
     """
-    使用 DoltHub JSON API 更新行情数据。
-    固定拉取 target_date 前 60 个自然日的数据，确保覆盖足够的交易日且无需下载全量数据。
+    使用 DoltHub 全量 CSV 更新行情数据（一次性下载全部历史，数据完整无截断）。
     返回 (success, trade_dates_list)，接口与 investment_data_sync_recent_window 完全相同。
     """
-    # 固定 60 天窗口：覆盖约 40 个交易日，保证数据完整性，避免全量下载
-    lookback_days = 60
-    start_date = target_date - timedelta(days=lookback_days)
-
-    df = fetch_dolthub_csv(start_date, target_date)
+    df = fetch_dolthub_csv()  # 全量下载，不传日期参数
     if df.empty:
         log.warning("⚠️ [DoltHub] 未获取到任何数据，降级到 Qlib")
         return False, []
 
-    # 从数据中推断实际交易日列表（最近 trade_days 个）
+    # 全量写入数据库（INSERT OR REPLACE，自动去重）
     all_dates = sorted(df["tradedate"].unique())
-    trade_dates = all_dates[-trade_days:] if len(all_dates) >= trade_days else all_dates
-    if not trade_dates:
-        return False, []
-
-    # 只保留窗口内的数据
-    df = df[df["tradedate"].isin(set(trade_dates))].copy()
-    if df.empty:
-        return False, list(trade_dates)
-
     with duckdb.connect(db_path) as con:
         ensure_core_tables(con)
         inserted, updated, skipped = _compare_and_sync_stock_rows(con, df)
 
+    # 返回最近 trade_days 个交易日供后续策略使用
+    trade_dates = all_dates[-trade_days:] if len(all_dates) >= trade_days else all_dates
+
     log.info(
-        f"✅ [DoltHub] {STOCKS_TABLE} 更新完成: "
+        f"✅ [DoltHub] {STOCKS_TABLE} 全量写入完成: "
         f"插入={inserted}, 更新={updated}, 跳过={skipped}, "
-        f"窗口={trade_dates[0]}~{trade_dates[-1]}"
+        f"最新交易日={all_dates[-1] if all_dates else 'N/A'}"
     )
     return (inserted + updated) > 0 or skipped > 0, list(trade_dates)
 
