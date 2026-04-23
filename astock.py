@@ -928,14 +928,14 @@ def fetch_dolthub_csv(start_date: date, end_date: date) -> pd.DataFrame:
         log.warning("⚠️ [DoltHub JSON API] 无数据，降级到 CSV 接口 …")
         import urllib.parse
         csv_sql = (
-            f"SELECT * FROM final_a_stock_eod_price "
+            f"SELECT * FROM ts_a_stock_eod_price "
             f"WHERE tradedate >= '{start_str}' AND tradedate <= '{end_str}'"
         )
         try:
             resp = session.get(
                 DOLTHUB_CSV_URL,
                 params={"q": csv_sql},
-                timeout=180,
+                timeout=2000,
             )
             resp.raise_for_status()
             df_csv = pd.read_csv(io.StringIO(resp.text))
