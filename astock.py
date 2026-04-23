@@ -901,27 +901,27 @@ def fetch_dolthub_csv(start_date: date, end_date: date) -> pd.DataFrame:
     all_rows: list = []
     next_page_token: Optional[str] = None
 
-    while True:
-        params: dict = {"q": sql}
-        if next_page_token:
-            params["pageToken"] = next_page_token
-        try:
-            resp = session.get(DOLTHUB_API_URL, params=params, timeout=120)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:
-            log.error(f"❌ [DoltHub JSON API] 请求失败: {exc}")
-            break
+    # while True:
+    #     params: dict = {"q": sql}
+    #     if next_page_token:
+    #         params["pageToken"] = next_page_token
+    #     try:
+    #         resp = session.get(DOLTHUB_API_URL, params=params, timeout=120)
+    #         resp.raise_for_status()
+    #         data = resp.json()
+    #     except Exception as exc:
+    #         log.error(f"❌ [DoltHub JSON API] 请求失败: {exc}")
+    #         break
 
-        rows = data.get("rows", [])
-        if not rows:
-            break
-        all_rows.extend(rows)
+    #     rows = data.get("rows", [])
+    #     if not rows:
+    #         break
+    #     all_rows.extend(rows)
 
-        next_page_token = data.get("next_page_token") or data.get("nextPageToken")
-        if not next_page_token:
-            break
-        log.info(f"   [DoltHub] 已获取 {len(all_rows)} 行，继续翻页 …")
+    #     next_page_token = data.get("next_page_token") or data.get("nextPageToken")
+    #     if not next_page_token:
+    #         break
+    #     log.info(f"   [DoltHub] 已获取 {len(all_rows)} 行，继续翻页 …")
 
     # ── 降级：JSON API 失败时尝试 CSV 接口 ──
     if not all_rows:
