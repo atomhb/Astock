@@ -95,7 +95,7 @@ CONFIG = {
     "adjust_cache_days": 320,
     "source_cache_ttl_seconds": 6 * 3600,
     "update_window_trade_days": 5,
-    "initial_replay_trade_days": 600,
+    "initial_replay_trade_days": 60,   # 初始回测天数
     "buy_fee_rate": 0.0005,
     "sell_fee_rate": 0.0010,
     "buy_pullback_pct": 0.01,
@@ -104,6 +104,9 @@ CONFIG = {
     "buy_confirm_ma20_margin": 0.99,        # 允许跌破MA20的容差
     "buy_signal_expire_days": 2,            # 挂单最长有效天数
     "market_health_check": True,            # 是否启用大盘过滤
+    "filter_gem_star": False,                # 过滤板块参数，如果为True则为全部股票，如果为False，则不纳入创业板（300 ，301）、科创板（688）
+    "init_cash": 100000.0,                  # 初始资金参数
+    "max_position_stocks": 3,              # 持仓中最多有的股票数
 }
 
 CONFIG["position_cash_cent"] = int(round(CONFIG["position_cash_yuan"] * 100))
@@ -527,7 +530,7 @@ def ensure_strategy_tables(con):
     
     cnt = con.execute("SELECT count(*) FROM account_state").fetchone()[0]
     if cnt == 0:
-        con.execute("INSERT INTO account_state(id, init_capital, total_assets, available_cash, updated_at) VALUES (1, 1000000.0, 1000000.0, 1000000.0, CURRENT_DATE)")
+        con.execute(f"INSERT INTO account_state(id, init_capital, total_assets, available_cash, updated_at) VALUES (1, {CONFIG['init_cash']}, {CONFIG['init_cash']}, {CONFIG['init_cash']}, CURRENT_DATE)")
 def initialize_empty_database(db_path: str):
     with duckdb.connect(db_path) as con:
         ensure_core_tables(con)
@@ -943,7 +946,8 @@ def rebuild_recent_adjusted_cache(db_path: str, end_date: date, window_days: int
 def get_account_state(con) -> Tuple[float, float, float]:
     row = con.execute("SELECT init_capital, total_assets, available_cash FROM account_state WHERE id = 1").fetchone()
     if not row:
-        return 1000000.0, 1000000.0, 1000000.0
+        cash = float(CONFIG.get("init_cash", 100000.0))
+        return cash, cash, cash
     return row[0], row[1], row[2]
 
 def detect_kline_patterns(open_s, high_s, low_s, close_s) -> Tuple[str, float, str, float]:
@@ -1057,8 +1061,8 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
     init_cap, total_assets, avail_cash = get_account_state(con)
     # Check reset condition
     if total_assets <= 0:
-        log.warning("资产归零或异常，执行重置恢复至100万元初始资金")
-        init_cap = total_assets = avail_cash = 1000000.0
+        log.warning(f"资产归零或异常，执行重置恢复至{CONFIG.get('init_cash', 100000.0)}初始资金")
+        init_cap = total_assets = avail_cash = float(CONFIG.get("init_cash", 100000.0))
         con.execute("DELETE FROM virtual_portfolio")
         con.execute("UPDATE account_state SET init_capital=?, total_assets=?, available_cash=? WHERE id=1", [init_cap, total_assets, avail_cash])
 
@@ -1084,6 +1088,9 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
     vol_ratio_min = float(CONFIG.get("buy_confirm_vol_ratio_min", 0.5))
     ma20_margin = float(CONFIG.get("buy_confirm_ma20_margin", 0.99))
     expire_days = int(CONFIG.get("buy_signal_expire_days", 2))
+    max_position = int(CONFIG.get("max_position_stocks", 10))
+    
+    current_holdings = con.execute("SELECT COUNT(*) FROM virtual_portfolio").fetchone()[0]
     
     filled_rows, expired_rows = [], []
     for _, row in pending_df.iterrows():
@@ -1147,7 +1154,7 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
                     continue
         
         # Determine if budget allows buying
-        if avail_cash >= position_cash_yuan * 0.5:  # ensure at least 50% of intended budget is available
+        if avail_cash >= position_cash_yuan * 0.5 and current_holdings < max_position:  # ensure at least 50% of intended budget is available
             cost_yuan_budget = min(position_cash_yuan, avail_cash)
         else:
             expired_rows.append((symbol, signal_date))
@@ -1186,6 +1193,7 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
                 actual_cost = round(gross_cost + buy_fee, 2)
             
             avail_cash -= actual_cost
+            current_holdings += 1
             filled_rows.append((symbol, trade_date, actual_buy_price_qfq, buy_price_hfq, int(shares), float(buy_fee)))
         else:
             expired_rows.append((symbol, signal_date))
@@ -1438,6 +1446,10 @@ def compute_all_signals(con, target_date: date) -> pd.DataFrame:
     picks["close"] = picks["close"].round(2)
     
     picks["date"] = pd.to_datetime(picks["date"]).dt.date
+    
+    if not CONFIG.get("filter_gem_star", True):
+        # 如果不纳入创业板（300, 301）、科创板（688）
+        picks = picks[~picks["symbol"].str.contains("^(?:300|301|688)")].copy()
     
     return picks[["symbol", "date", "close", "planned_buy_price", "ret_5d", "ret_20d", "total_score", "signal_strength", "kline_pattern", "vol_bb_break"]]
 
