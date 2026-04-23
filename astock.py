@@ -136,6 +136,8 @@ STOCKS_TABLE = "stock_prices"
 STOCK_DATE_COL = "tradedate"
 STOCK_SYMBOL_COL = "symbol"
 QLIB_DATA_URL = "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"
+DOLTHUB_CSV_URL = "https://www.dolthub.com/csv/chenditc/investment_data/master/ts_a_stock_eod_price"
+DOLTHUB_API_URL  = "https://www.dolthub.com/api/v1alpha1/chenditc/investment_data/master"  # JSON API（优先）
 QLIB_DATA_DIR = os.path.expanduser("~/.qlib/qlib_data/cn_data")
 QLIB_TAR_PATH = os.path.join(BASE_DIR, "qlib_bin.tar.gz")
 _QLIB_INITIALIZED = False
@@ -863,6 +865,160 @@ def investment_data_sync_recent_window(db_path: str, target_date: date, trade_da
         inserted, updated, skipped = _compare_and_sync_stock_rows(con, window_df)
     log.info(f"✅ {STOCKS_TABLE} 5交易日比对完成: 插入={inserted}, 更新={updated}, 跳过={skipped}")
     return (inserted + updated) > 0 or skipped > 0, trade_dates
+
+
+
+# =========================================================
+# DoltHub CSV 数据源（最优先）
+# =========================================================
+def _normalize_dolthub_symbol(sym: str) -> str:
+    """将 DoltHub 返回的 symbol 格式统一为 canonical（如 000001.SZ）。"""
+    raw = str(sym).strip()
+    # DoltHub 格式示例: 000001.SZ / SH600000 / 600000.SH
+    return canonical_symbol(raw)
+
+
+def fetch_dolthub_csv(start_date: date, end_date: date) -> pd.DataFrame:
+    """
+    使用 DoltHub JSON API 分页拉取 final_a_stock_eod_price 表数据。
+    字段与数据库 stock_prices 表完全一致：
+        tradedate, symbol, high, low, open, close, adjclose, volume, amount
+
+    优先使用 JSON API（/api/v1alpha1），失败后降级到 CSV 接口。
+    start_date 默认为 target_date 前 60 天，确保数据完整性且避免全量下载。
+    """
+    session = build_retry_session()
+    start_str = start_date.strftime("%Y%m%d")   # final_a_stock_eod_price 的日期格式为 YYYYMMDD
+    end_str   = end_date.strftime("%Y%m%d")
+    log.info(f"⬇️ [DoltHub JSON API] 拉取数据: {start_str} ~ {end_str}")
+
+    sql = (
+        f"SELECT * FROM final_a_stock_eod_price "
+        f"WHERE tradedate >= '{start_str}' AND tradedate <= '{end_str}' "
+        f"ORDER BY tradedate ASC"
+    )
+
+    all_rows: list = []
+    next_page_token: Optional[str] = None
+
+    while True:
+        params: dict = {"q": sql}
+        if next_page_token:
+            params["pageToken"] = next_page_token
+        try:
+            resp = session.get(DOLTHUB_API_URL, params=params, timeout=120)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            log.error(f"❌ [DoltHub JSON API] 请求失败: {exc}")
+            break
+
+        rows = data.get("rows", [])
+        if not rows:
+            break
+        all_rows.extend(rows)
+
+        next_page_token = data.get("next_page_token") or data.get("nextPageToken")
+        if not next_page_token:
+            break
+        log.info(f"   [DoltHub] 已获取 {len(all_rows)} 行，继续翻页 …")
+
+    # ── 降级：JSON API 失败时尝试 CSV 接口 ──
+    if not all_rows:
+        log.warning("⚠️ [DoltHub JSON API] 无数据，降级到 CSV 接口 …")
+        import urllib.parse
+        csv_sql = (
+            f"SELECT * FROM final_a_stock_eod_price "
+            f"WHERE tradedate >= '{start_str}' AND tradedate <= '{end_str}'"
+        )
+        try:
+            resp = session.get(
+                DOLTHUB_CSV_URL,
+                params={"q": csv_sql},
+                timeout=180,
+            )
+            resp.raise_for_status()
+            df_csv = pd.read_csv(io.StringIO(resp.text))
+            if df_csv.empty:
+                log.warning("⚠️ [DoltHub CSV] 也无数据")
+                return pd.DataFrame()
+            all_rows = df_csv.to_dict("records")
+        except Exception as exc2:
+            log.error(f"❌ [DoltHub CSV] 降级也失败: {exc2}")
+            return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    if df.empty:
+        log.warning("⚠️ [DoltHub] 返回空数据")
+        return pd.DataFrame()
+
+    # ── 确保必需列存在 ──
+    required = ["tradedate", "symbol", "high", "low", "open", "close"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        log.error(f"❌ [DoltHub] 缺少必需列: {missing}，实际列={list(df.columns)}")
+        return pd.DataFrame()
+
+    # adjclose / amount / volume 容错
+    if "adjclose" not in df.columns:
+        df["adjclose"] = df["close"]
+    if "amount" not in df.columns:
+        df["amount"] = 0.0
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
+
+    # tradedate 支持 YYYYMMDD 整数字符串 或 YYYY-MM-DD 格式
+    df["tradedate"] = pd.to_datetime(df["tradedate"].astype(str), errors="coerce").dt.date
+    df["symbol"]    = df["symbol"].map(_normalize_dolthub_symbol)
+
+    for col in ["high", "low", "open", "close", "adjclose", "amount"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").round(0)
+
+    df = df.dropna(subset=["tradedate", "symbol", "open", "high", "low", "close", "adjclose"])
+    df = df.drop_duplicates(subset=["tradedate", "symbol"], keep="last")
+    df = df[(df["tradedate"] >= start_date) & (df["tradedate"] <= end_date)]
+
+    log.info(f"✅ [DoltHub] 获取 {len(df)} 行数据，共 {df['symbol'].nunique()} 只股票")
+    return df[["tradedate", "symbol", "high", "low", "open", "close", "adjclose", "volume", "amount"]].copy()
+
+
+def dolthub_sync_recent_window(db_path: str, target_date: date, trade_days: int) -> Tuple[bool, List[date]]:
+    """
+    使用 DoltHub JSON API 更新行情数据。
+    固定拉取 target_date 前 60 个自然日的数据，确保覆盖足够的交易日且无需下载全量数据。
+    返回 (success, trade_dates_list)，接口与 investment_data_sync_recent_window 完全相同。
+    """
+    # 固定 60 天窗口：覆盖约 40 个交易日，保证数据完整性，避免全量下载
+    lookback_days = 60
+    start_date = target_date - timedelta(days=lookback_days)
+
+    df = fetch_dolthub_csv(start_date, target_date)
+    if df.empty:
+        log.warning("⚠️ [DoltHub] 未获取到任何数据，降级到 Qlib")
+        return False, []
+
+    # 从数据中推断实际交易日列表（最近 trade_days 个）
+    all_dates = sorted(df["tradedate"].unique())
+    trade_dates = all_dates[-trade_days:] if len(all_dates) >= trade_days else all_dates
+    if not trade_dates:
+        return False, []
+
+    # 只保留窗口内的数据
+    df = df[df["tradedate"].isin(set(trade_dates))].copy()
+    if df.empty:
+        return False, list(trade_dates)
+
+    with duckdb.connect(db_path) as con:
+        ensure_core_tables(con)
+        inserted, updated, skipped = _compare_and_sync_stock_rows(con, df)
+
+    log.info(
+        f"✅ [DoltHub] {STOCKS_TABLE} 更新完成: "
+        f"插入={inserted}, 更新={updated}, 跳过={skipped}, "
+        f"窗口={trade_dates[0]}~{trade_dates[-1]}"
+    )
+    return (inserted + updated) > 0 or skipped > 0, list(trade_dates)
 
 
 def get_recent_trade_dates(con, end_date: date, n: int) -> List[date]:
@@ -2093,13 +2249,15 @@ def run_daily_pipeline():
             latest_before = _latest_trade_date_in_db(con, target_date)
             log.info(f"ℹ️ 更新前数据库最新交易日: {latest_before}")
 
-        synced, _ = investment_data_sync_recent_window(
-            db_path,
-            target_date,
-            int(CONFIG["update_window_trade_days"]),
-        )
+        # ── 数据源优先级：DoltHub CSV（最优先）→ Qlib tar.gz（降级）──
+        _trade_days = int(CONFIG["update_window_trade_days"])
+        log.info("🌐 [优先] 尝试从 DoltHub CSV 拉取行情数据 …")
+        synced, _ = dolthub_sync_recent_window(db_path, target_date, _trade_days)
         if not synced:
-            log.warning("⚠️ 本次未获取到窗口行情，继续使用已有数据库数据")
+            log.warning("⚠️ DoltHub 拉取失败，降级到 Qlib tar.gz 数据源 …")
+            synced, _ = investment_data_sync_recent_window(db_path, target_date, _trade_days)
+        if not synced:
+            log.warning("⚠️ 所有数据源均未获取到窗口行情，继续使用已有数据库数据")
 
         latest_trade_date, result = run_strategy_with_replay_if_needed(db_path, target_date)
         if latest_trade_date is None or result is None:
