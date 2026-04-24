@@ -2233,7 +2233,7 @@ def run_daily_pipeline():
         # ── 数据源优先级：DoltHub CSV（最优先）→ Qlib tar.gz（降级）──
         _trade_days = int(CONFIG["update_window_trade_days"])
         log.info("🌐 [优先] 尝试从 DoltHub CSV 拉取行情数据 …")
-        synced, _ = dolthub_sync_recent_window(db_path, target_date, _trade_days)
+        # synced, _ = dolthub_sync_recent_window(db_path, target_date, _trade_days)
         if not synced:
             log.warning("⚠️ DoltHub 拉取失败，降级到 Qlib tar.gz 数据源 …")
             synced, _ = investment_data_sync_recent_window(db_path, target_date, _trade_days)
