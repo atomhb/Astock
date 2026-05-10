@@ -106,7 +106,7 @@ CONFIG = {
     "market_health_check": True,            # 是否启用大盘过滤
     "filter_gem_star": False,                # 过滤板块参数，如果为True则为全部股票，如果为False，则不纳入创业板（300 ，301）、科创板（688）
     "init_cash": 100000.0,                  # 初始资金参数
-    "max_position_stocks": 3,              # 持仓中最多有的股票数
+    "max_position_stocks": 5,              # 持仓中最多有的股票数
 }
 
 CONFIG["position_cash_cent"] = int(round(CONFIG["position_cash_yuan"] * 100))
