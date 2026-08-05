@@ -95,7 +95,7 @@ CONFIG = {
     "top_n": 20,
     "adjust_cache_days": 320,
     "source_cache_ttl_seconds": 6 * 3600,
-    "update_window_trade_days": 5,
+    "update_window_trade_days": 30,
     "initial_replay_trade_days": 60,       # 初始回测天数
     "buy_fee_rate": 0.0005,
     "sell_fee_rate": 0.0010,
