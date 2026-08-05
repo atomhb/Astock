@@ -8,11 +8,12 @@
 5. 策略和报表直接读取 stocks / qfq / hfq 结果表。
 6. 选股信号使用前复权数据；收益率和止盈止损收益判断使用后复权数据。
 7. 布林带量价MACD共振选股。
-8. 买入规则：T日收盘出信号，T+1 最低价 <= T日收盘价*(1-BUY_PULLBACK_PCT) 才成交。
-9. 卖出规则：跌破MA20 / 持有N天 / 止盈 / 止损。
-10. OneDrive 没有数据库时创建空库并拉取窗口行情。
-11. 日常已有数据库时执行5交易日比对增量更新。
-12. 最终数据库使用 gzip 压缩上传，降低网络传输成本。
+8. 动态 ATR (14) 挂单与止损：挂单价 = T日收盘价 - alpha * ATR(14)；止损阈值 = -beta * ATR_pct。
+9. 风险平价 (Risk Parity) + 大盘环境多级仓位管理。
+10. 卖出规则：跌破MA20 / 动态ATR止损 / 跌破布林中轨 / 持有N天。
+11. OneDrive 没有数据库时创建空库并拉取窗口行情。
+12. 日常已有数据库时执行5交易日比对增量更新。
+13. 最终数据库使用 gzip 压缩上传，降低网络传输成本。
 """
 import os
 import sys
@@ -89,35 +90,32 @@ CONFIG = {
     "bootstrap_days": 120,
     "position_cash_yuan": 50000.0,
     "take_profit_pct": 10.0,
-    "stop_loss_pct": -5.0,
+    "stop_loss_pct": -5.0,                  # 备用固定止损（若无ATR数据时降级使用）
     "max_hold_days": 200,
     "top_n": 20,
     "adjust_cache_days": 320,
     "source_cache_ttl_seconds": 6 * 3600,
     "update_window_trade_days": 5,
-    "initial_replay_trade_days": 60,   # 初始回测天数
+    "initial_replay_trade_days": 60,       # 初始回测天数
     "buy_fee_rate": 0.0005,
     "sell_fee_rate": 0.0010,
-    "buy_pullback_pct": 0.01,
-    "buy_confirm_day_drop_limit": -0.03,    # T+1日内跌幅上限
-    "buy_confirm_vol_ratio_min": 0.5,       # T+1相对量比下限
-    "buy_confirm_ma20_margin": 0.99,        # 允许跌破MA20的容差
-    "buy_signal_expire_days": 2,            # 挂单最长有效天数
-    "market_health_check": True,            # 是否启用大盘过滤
-    "filter_gem_star": False,                # 过滤板块参数，如果为True则为全部股票，如果为False，则不纳入创业板（300 ，301）、科创板（688）
-    "init_cash": 100000.0,                  # 初始资金参数
-    "max_position_stocks": 5,              # 持仓中最多有的股票数
+    
+    # ── 1. 动态 ATR (14) 参数配置 ──
+    "atr_period": 14,                      # ATR 算周期
+    "atr_buy_alpha": 0.5,                  # 挂单价系数：挂单价 = T日收盘价 - 0.5 * ATR(14)
+    "atr_stop_loss_beta": 2.0,             # 动态止损系数：止损触发点 = -2.0 * ATR_pct
+    
+    "buy_confirm_day_drop_limit": -0.03,   # T+1日内跌幅上限
+    "buy_confirm_vol_ratio_min": 0.5,      # T+1相对量比下限
+    "buy_confirm_ma20_margin": 0.99,       # 允许跌破MA20的容差
+    "buy_signal_expire_days": 2,           # 挂单最长有效天数
+    "market_health_check": True,           # 是否启用大盘过滤
+    "filter_gem_star": False,               # 是否过滤创业板/科创板
+    "init_cash": 100000.0,                 # 初始资金参数
+    "max_position_stocks": 5,             # 持仓中最多有的股票数
 }
 
 CONFIG["position_cash_cent"] = int(round(CONFIG["position_cash_yuan"] * 100))
-
-
-def get_buy_pullback_pct() -> float:
-    return float(CONFIG.get("buy_pullback_pct", 0.01))
-
-
-def get_buy_trigger_pct() -> float:
-    return 1.0 - get_buy_pullback_pct()
 
 
 def _format_size_mb(size_mb: float) -> str:
@@ -137,19 +135,19 @@ STOCK_DATE_COL = "tradedate"
 STOCK_SYMBOL_COL = "symbol"
 QLIB_DATA_URL = "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"
 DOLTHUB_CSV_URL = "https://www.dolthub.com/csv/chenditc/investment_data/master/ts_a_stock_eod_price"
-DOLTHUB_API_URL  = "https://www.dolthub.com/api/v1alpha1/chenditc/investment_data/master"  # JSON API（优先）
+DOLTHUB_API_URL  = "https://www.dolthub.com/api/v1alpha1/chenditc/investment_data/master"
 QLIB_DATA_DIR = os.path.expanduser("~/.qlib/qlib_data/cn_data")
 QLIB_TAR_PATH = os.path.join(BASE_DIR, "qlib_bin.tar.gz")
 _QLIB_INITIALIZED = False
 
-# ── 数据库编码常量（避免存储字符串）──
+# ── 数据库编码常量 ──
 TRADE_BUY = 0
 TRADE_SELL = 1
 STATUS_PENDING = 0
 STATUS_FILLED = 1
 STATUS_EXPIRED = 2
-# reason 位掩码：可组合多个卖出原因
-REASON_STOPLOSS = 1        # bit0: 止损
+
+REASON_STOPLOSS = 1        # bit0: 动态ATR/固定止损
 REASON_BELOW_MA20 = 2      # bit1: 跌破MA20
 REASON_MAX_HOLD = 4        # bit2: 持有超期
 REASON_BELOW_BOLL_MID = 8  # bit3: 跌破布林中轨
@@ -159,17 +157,15 @@ REASON_BUY_T1 = 64         # bit6: T+1买入
 
 
 def decode_trade_type_label(code) -> str:
-    """将交易类型数字编码转为显示文本。"""
     return "🟢 买入" if code == TRADE_BUY else "🔴 卖出"
 
 
 def decode_reason_text(code) -> str:
-    """将卖出原因位掩码转为显示文本。"""
     if code is None or code == 0:
         return ""
     parts = []
     if code & REASON_STOPLOSS:
-        parts.append(f"止损{CONFIG['stop_loss_pct']}%")
+        parts.append("动态ATR止损")
     if code & REASON_BELOW_MA20:
         parts.append("跌破MA20")
     if code & REASON_MAX_HOLD:
@@ -181,7 +177,7 @@ def decode_reason_text(code) -> str:
     if code & REASON_MACD_DECREASE:
         parts.append("MACD差值减小")
     if code & REASON_BUY_T1:
-        parts.append(f"T+1回落{get_buy_pullback_pct() * 100:.1f}%成交")
+        parts.append("T+1动态ATR挂单成交")
     return " / ".join(parts) if parts else ""
 
 def _resolve_local_db_gz_path() -> Optional[str]:
@@ -199,8 +195,8 @@ LOCAL_DB_GZ_PATH = _resolve_local_db_gz_path()
 # =========================================================
 def get_target_date() -> date:
     now_beijing = datetime.now(CN_TZ)
-    # now_beijing = datetime(2026, 4, 10, 17, 0, 0, tzinfo=CN_TZ)
     return (now_beijing - timedelta(days=1)).date() if now_beijing.hour < 16 else now_beijing.date()
+
 def build_retry_session() -> requests.Session:
     retry = Retry(
         total=3,
@@ -256,14 +252,14 @@ def decode_numeric_frame(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     out = df.copy()
-    for col in ["open", "high", "low", "close", "buy_price", "buy_price_hfq", "last_price", "last_price_hfq", "planned_buy_price", "signal_close", "price", "adjclose"]:
+    for col in ["open", "high", "low", "close", "buy_price", "buy_price_hfq", "last_price", "last_price_hfq", "planned_buy_price", "signal_close", "price", "adjclose", "atr_pct", "atr_pct_buy"]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
     for col in ["volume", "amount"]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
-    # market_value 和 cost 在 evaluate_strategy 中已经以元为单位计算，不需要再次缩放
     return out
+
 # =========================================================
 # Token / OneDrive
 # =========================================================
@@ -272,7 +268,6 @@ class TokenManager:
         self.client_id = client_id
         self.token_file = token_file
         self._data = {}
-        # CI / CL 平台仅从 ONEDRIVE_TOKEN_CACHE_B64 读取一次性注入的 token 缓存
         b64 = os.getenv("ONEDRIVE_TOKEN_CACHE_B64", "").strip()
         if IS_CI and b64:
             clean = b64.replace("\\n", "").replace(" ", "")
@@ -280,10 +275,12 @@ class TokenManager:
         elif (not IS_CI) and os.path.exists(token_file):
             with open(token_file, "r", encoding="utf-8") as f:
                 self._data = json.load(f)
+
     def _save(self):
         if not IS_CI:
             with open(self.token_file, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, ensure_ascii=False, indent=2)
+
     def _refresh(self):
         rt = self._data.get("refresh_token", "")
         if not rt:
@@ -305,15 +302,18 @@ class TokenManager:
         if "refresh_token" in data:
             self._data["refresh_token"] = data["refresh_token"]
         self._save()
+
     def get_access_token(self) -> str:
         if self._data.get("expires_at", 0) < time.time() - 60:
             self._refresh()
         token = self._data.get("access_token", "")
         if not token:
-            raise RuntimeError("尚未完成授权，请先执行：python astock_strict_integer.py auth")
+            raise RuntimeError("尚未完成授权，请先执行授权模式。")
         return token
+
     def headers(self) -> Dict[str, str]:
         return {"Authorization": f"Bearer {self.get_access_token()}"}
+
     def device_code_auth(self):
         resp = requests.post(DEVICE_URL, data={"client_id": self.client_id, "scope": SCOPES}, timeout=30).json()
         print(f"\n🔗 请在浏览器打开：{resp['verification_uri']}")
@@ -342,16 +342,21 @@ class TokenManager:
             if pr.get("error") != "authorization_pending":
                 raise RuntimeError(f"设备码授权失败: {pr}")
         raise TimeoutError("设备码授权超时")
+
     def export_base64_cache(self) -> str:
         return base64.b64encode(json.dumps(self._data, ensure_ascii=False).encode("utf-8")).decode()
+
+
 class OneDriveClient:
     def __init__(self, token_mgr: TokenManager, folder: str, remote_gz_name: str):
         self.tm = token_mgr
         self.folder = folder
         self.remote_gz_name = remote_gz_name
+
     def download_database_gz(self, local_path: str) -> bool:
         url = f"{GRAPH_BASE}/me/drive/root:/{self.folder}/{self.remote_gz_name}:/content"
-        resp = requests.get(url, headers=self.tm.headers(), stream=True, timeout=60)
+        session = build_retry_session()
+        resp = session.get(url, headers=self.tm.headers(), stream=True, timeout=60)
         if resp.status_code == 404:
             return False
         resp.raise_for_status()
@@ -363,10 +368,12 @@ class OneDriveClient:
                         f.write(chunk)
                         pbar.update(len(chunk))
         return True
+
     def upload_database_gz(self, local_path: str):
         size = os.path.getsize(local_path)
         url = f"{GRAPH_BASE}/me/drive/root:/{self.folder}/{self.remote_gz_name}:/createUploadSession"
-        session_resp = requests.post(
+        session = build_retry_session()
+        session_resp = session.post(
             url,
             headers={**self.tm.headers(), "Content-Type": "application/json"},
             json={"item": {"@microsoft.graph.conflictBehavior": "replace"}},
@@ -374,32 +381,47 @@ class OneDriveClient:
         )
         session_resp.raise_for_status()
         upload_url = session_resp.json()["uploadUrl"]
+
         with open(local_path, "rb") as f:
             with tqdm(total=size, unit="B", unit_scale=True, desc="⬆️ 上传更新后数据库") as pbar:
                 offset = 0
                 while offset < size:
                     chunk = f.read(CHUNK_SIZE)
                     end = offset + len(chunk) - 1
-                    put_resp = requests.put(
-                        upload_url,
-                        headers={
-                            "Content-Range": f"bytes {offset}-{end}/{size}",
-                            "Content-Length": str(len(chunk)),
-                        },
-                        data=chunk,
-                        timeout=120,
-                    )
-                    put_resp.raise_for_status()
+
+                    # ── 分块上传指数退避重试逻辑 ──
+                    max_retries = 5
+                    for attempt in range(1, max_retries + 1):
+                        try:
+                            put_resp = requests.put(
+                                upload_url,
+                                headers={
+                                    "Content-Range": f"bytes {offset}-{end}/{size}",
+                                    "Content-Length": str(len(chunk)),
+                                },
+                                data=chunk,
+                                timeout=120,
+                            )
+                            put_resp.raise_for_status()
+                            break
+                        except requests.exceptions.RequestException as e:
+                            if attempt == max_retries:
+                                log.error(f"❌ 分块上传失败 ({offset}-{end}/{size})，已达最大重试次数")
+                                raise
+                            wait_time = attempt * 5
+                            log.warning(f"⚠️ 分块上传异常 ({e})，{wait_time} 秒后进行第 {attempt + 1}/{max_retries} 次重试...")
+                            time.sleep(wait_time)
+
                     offset += len(chunk)
                     pbar.update(len(chunk))
-                    
+
 # =========================================================
 # 本地 DB ↔ OneDrive gz 工具
 # =========================================================
 _DB_GZ_NAME = CONFIG["cloud_db_gz_name"]
 _DB_GZIP_COMPRESSLEVEL = 6
+
 def db_compress_and_upload(odc: OneDriveClient, db_path: str, gz_path: str) -> None:
-    """将 db_path 压缩为 gz_path，然后上传到 OneDrive。"""
     raw_size_mb = _file_size_mb(db_path)
     with open(db_path, "rb") as fi, gzip.open(gz_path, "wb", compresslevel=_DB_GZIP_COMPRESSLEVEL) as fo:
         shutil.copyfileobj(fi, fo)
@@ -411,7 +433,6 @@ def db_compress_and_upload(odc: OneDriveClient, db_path: str, gz_path: str) -> N
 
 
 def db_compress_to_local(db_path: str, local_gz_path: str) -> None:
-    """将 db_path 压缩并保存到本地 gz 文件。"""
     local_dir = os.path.dirname(local_gz_path)
     if local_dir:
         os.makedirs(local_dir, exist_ok=True)
@@ -424,16 +445,11 @@ def db_compress_to_local(db_path: str, local_gz_path: str) -> None:
 
 
 def db_decompress_from_download(gz_path: str, db_path: str) -> None:
-    """将下载好的 gz_path 解压到 db_path（原始 duckdb 文件）。"""
     with gzip.open(gz_path, "rb") as fi, open(db_path, "wb") as fo:
         shutil.copyfileobj(fi, fo)
 
 
 def obtain_db_gz(local_gz_path: Optional[str], odc: OneDriveClient, temp_gz_path: str) -> Tuple[str, bool]:
-    """
-    获取数据库压缩包：先尝试读取固定本地路径，失败后再从 OneDrive 下载到临时路径。
-    返回 (source, ready)，source 为 local/cloud/none。
-    """
     if local_gz_path and os.path.isfile(local_gz_path) and os.path.getsize(local_gz_path) > 1024:
         log.info(f"📁 使用本地数据库压缩文件: {local_gz_path}")
         shutil.copyfile(local_gz_path, temp_gz_path)
@@ -445,8 +461,8 @@ def obtain_db_gz(local_gz_path: Optional[str], odc: OneDriveClient, temp_gz_path
 
 
 def load_db_gz_to_local(gz_path: str, db_path: str) -> None:
-    """将 gz 文件解压为本地 duckdb 文件。"""
     db_decompress_from_download(gz_path, db_path)
+
 # =========================================================
 # 数据库表结构
 # =========================================================
@@ -476,6 +492,7 @@ def ensure_strategy_tables(con):
             trade_type TINYINT,
             status TINYINT,
             signal_strength DOUBLE,
+            atr_pct DOUBLE,
             PRIMARY KEY (symbol, signal_date)
         )
     """)
@@ -488,15 +505,26 @@ def ensure_strategy_tables(con):
         con.execute("ALTER TABLE pending_orders ADD COLUMN IF NOT EXISTS signal_strength DOUBLE")
     except Exception:
         pass
+    try:
+        con.execute("ALTER TABLE pending_orders ADD COLUMN IF NOT EXISTS atr_pct DOUBLE")
+    except Exception:
+        pass
+
     con.execute("""
         CREATE TABLE IF NOT EXISTS virtual_portfolio (
             symbol VARCHAR PRIMARY KEY,
             buy_date DATE,
             buy_price DOUBLE,
             buy_price_hfq DOUBLE,
-            shares BIGINT
+            shares BIGINT,
+            atr_pct_buy DOUBLE
         )
     """)
+    try:
+        con.execute("ALTER TABLE virtual_portfolio ADD COLUMN IF NOT EXISTS atr_pct_buy DOUBLE")
+    except Exception:
+        pass
+
     con.execute("""
         CREATE TABLE IF NOT EXISTS trade_history (
             symbol VARCHAR,
@@ -533,6 +561,7 @@ def ensure_strategy_tables(con):
     cnt = con.execute("SELECT count(*) FROM account_state").fetchone()[0]
     if cnt == 0:
         con.execute(f"INSERT INTO account_state(id, init_capital, total_assets, available_cash, updated_at) VALUES (1, {CONFIG['init_cash']}, {CONFIG['init_cash']}, {CONFIG['init_cash']}, CURRENT_DATE)")
+
 def initialize_empty_database(db_path: str):
     with duckdb.connect(db_path) as con:
         ensure_core_tables(con)
@@ -541,7 +570,6 @@ def initialize_empty_database(db_path: str):
 
 
 def drop_cache_tables(con):
-    """清理临时缓存表（每次运行重建），保留策略持久表（持仓/账户/交易记录）。"""
     for t in ["daily_qfq_cache", "daily_hfq_cache"]:
         row = con.execute(
             "SELECT table_type FROM information_schema.tables WHERE table_name = ?", [t]
@@ -555,7 +583,6 @@ def drop_cache_tables(con):
 
 
 def compact_database(con) -> None:
-    """在最终写出前回收已删除对象占用的空间。"""
     con.execute("CHECKPOINT")
     try:
         con.execute("VACUUM")
@@ -605,13 +632,11 @@ def _prune_trade_history(con, keep_trade_days: int = 5) -> None:
 
 
 def apply_history_retention(con) -> None:
-    # 只清理挂单表里的历史尾部，避免压缩后丢失交易/账户历史导致结果不一致。
     _prune_pending_orders(con)
     _prune_account_history(con)
     _prune_trade_history(con, keep_trade_days=500)
 
 def _migrate_db_schema(con):
-    """一次性 schema 迁移: stock_prices TIMESTAMP→DATE + PRIMARY KEY + FLOAT精度。"""
     tables = [t[0] for t in con.execute("SHOW TABLES").fetchall()]
     if STOCKS_TABLE not in tables:
         return
@@ -646,7 +671,6 @@ def _migrate_db_schema(con):
     con.execute("ALTER TABLE stock_prices_new RENAME TO stock_prices")
     con.execute("CHECKPOINT")
     log.info("✅ stock_prices 迁移完成")
-
 
 # =========================================================
 # investment_data 数据更新
@@ -764,7 +788,6 @@ def fetch_qlib_features(start_date: date, end_date: date) -> pd.DataFrame:
     for col in ["high", "low", "open", "close", "adjclose", "volume", "amount", "factor"]:
         out[col] = pd.to_numeric(out[col], errors="coerce")
 
-    # Qlib 的 OHLC 常为标准化值，需除以 factor 还原为可交易价格。
     factor = out["factor"].replace(0, np.nan).replace([np.inf, -np.inf], np.nan).fillna(1.0)
     for col in ["open", "high", "low", "close"]:
         out[col] = out[col] / factor
@@ -866,20 +889,10 @@ def investment_data_sync_recent_window(db_path: str, target_date: date, trade_da
     log.info(f"✅ {STOCKS_TABLE} 5交易日比对完成: 插入={inserted}, 更新={updated}, 跳过={skipped}")
     return (inserted + updated) > 0 or skipped > 0, trade_dates
 
-
-
 # =========================================================
-# DoltHub CSV 数据源（最优先）
+# DoltHub CSV 数据源（降级方案）
 # =========================================================
-def _normalize_dolthub_symbol(sym: str) -> str:
-    """将 DoltHub 返回的 symbol 格式统一为 canonical（如 000001.SZ）。"""
-    raw = str(sym).strip()
-    # DoltHub 格式示例: 000001.SZ / SH600000 / 600000.SH
-    return canonical_symbol(raw)
-
-
 def _clean_dolthub_chunk(df: pd.DataFrame) -> pd.DataFrame:
-    """对一个 CSV 分块做列名校验、类型转换、去重清洗，返回符合 stock_prices 结构的 DataFrame。"""
     required = ["tradedate", "symbol", "high", "low", "open", "close"]
     if any(c not in df.columns for c in required):
         return pd.DataFrame()
@@ -900,13 +913,8 @@ def _clean_dolthub_chunk(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
-    """
-    流式下载 DoltHub 全量 CSV，边下载边解析边写库。
-    内存中同时只保留约 STREAM_CHUNK_ROWS 行，彻底避免 OOM。
-    返回 (success, all_trade_dates_list)。
-    """
-    STREAM_CHUNK_ROWS = 50_000   # 每批写入行数，约 5-8 MB 内存
-    DOWNLOAD_CHUNK_KB = 512      # 每次 iter_content 读取大小
+    STREAM_CHUNK_ROWS = 50_000
+    DOWNLOAD_CHUNK_KB = 512
 
     url = "https://www.dolthub.com/csv/chenditc/investment_data/master/final_a_stock_eod_price"
     session = build_retry_session()
@@ -924,11 +932,6 @@ def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
     total_inserted = 0
     all_dates: set = set()
 
-    # 用 io.TextIOWrapper 把字节流包装成文本流，直接喂给 pd.read_csv chunksize 迭代器
-    # 但 requests 的 iter_content 不是标准 IO，需要中转缓冲
-    raw_buf = io.BytesIO()
-    header_written = False
-
     with tqdm(
         total=total_size if total_size > 0 else None,
         unit="B",
@@ -937,8 +940,6 @@ def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
         desc="⬇️ DoltHub 流式CSV",
         dynamic_ncols=True,
     ) as pbar:
-        # 把整个响应流写入一个 SpooledTemporaryFile（超过阈值落盘，不超则留内存）
-        import tempfile
         with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as spooled:
             for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_KB * 1024):
                 if chunk:
@@ -955,7 +956,7 @@ def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
                     spooled,
                     chunksize=STREAM_CHUNK_ROWS,
                     low_memory=True,
-                    dtype=str,          # 全部先读为字符串，清洗时再转类型
+                    dtype=str,
                 )
             except Exception as exc:
                 log.error(f"❌ [DoltHub 流式CSV] CSV 解析器初始化失败: {exc}")
@@ -976,18 +977,12 @@ def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
     all_dates_sorted = sorted(all_dates)
     log.info(
         f"✅ [DoltHub 流式CSV] 写库完成: 共写入 {total_inserted:,} 条，"
-        f"覆盖 {len(all_dates_sorted)} 个交易日，"
-        f"最新={all_dates_sorted[-1] if all_dates_sorted else 'N/A'}"
+        f"覆盖 {len(all_dates_sorted)} 个交易日"
     )
     return total_inserted > 0, all_dates_sorted
 
 
 def dolthub_sync_recent_window(db_path: str, target_date: date, trade_days: int) -> Tuple[bool, List[date]]:
-    """
-    流式下载 DoltHub 全量 CSV 并写库。
-    边下载边解析边写入，内存中同时只保留一个分块，彻底避免 OOM。
-    返回 (success, trade_dates_list)，接口与 investment_data_sync_recent_window 完全相同。
-    """
     success, all_dates = dolthub_stream_to_db(db_path)
     if not success:
         return False, []
@@ -1007,12 +1002,10 @@ def get_recent_trade_dates(con, end_date: date, n: int) -> List[date]:
         return []
     return sorted(pd.to_datetime(df["date"]).dt.date.tolist())
 
-
 # =========================================================
 # 复权计算（前复权 QFQ / 后复权 HFQ）
 # =========================================================
 def rebuild_recent_adjusted_cache(db_path: str, end_date: date, window_days: int) -> bool:
-    """构建复权缓存。HFQ 表只建一次（全局不变），QFQ 视图按 end_date 动态锚定。"""
     with duckdb.connect(db_path) as con:
         ensure_core_tables(con)
         recent_dates = get_recent_trade_dates(con, end_date, window_days)
@@ -1020,8 +1013,6 @@ def rebuild_recent_adjusted_cache(db_path: str, end_date: date, window_days: int
             return False
         start_date = recent_dates[0]
 
-        # ── HFQ（后复权）：adj_factor = adjclose / close ──
-        # HFQ 价格 = raw_price * adj_factor，与 end_date 无关，只需建一次表
         hfq_exists = con.execute(
             "SELECT COUNT(*) FROM information_schema.tables WHERE table_name='daily_hfq_cache'"
         ).fetchone()[0] > 0
@@ -1038,15 +1029,11 @@ def rebuild_recent_adjusted_cache(db_path: str, end_date: date, window_days: int
                     volume, amount
                 FROM {STOCKS_TABLE}
             """)
-            # 为后续查询加速建索引
             try:
                 con.execute("CREATE INDEX idx_hfq_sym_date ON daily_hfq_cache(symbol, date)")
             except Exception:
                 pass
 
-        # ── QFQ（前复权）：QFQ = HFQ / last_adj_factor ──
-        # last_adj_factor 随 end_date 变化，所以用轻量级 View 动态计算
-        # 从 HFQ 表读取，除以每只股票在 end_date 当天的 adj_factor
         end_str = end_date.strftime('%Y-%m-%d')
         start_str = start_date.strftime('%Y-%m-%d')
         con.execute("DROP VIEW IF EXISTS daily_qfq_cache")
@@ -1070,6 +1057,7 @@ def rebuild_recent_adjusted_cache(db_path: str, end_date: date, window_days: int
             WHERE h.date BETWEEN '{start_str}' AND '{end_str}'
         """)
     return True
+
 # =========================================================
 # 策略逻辑
 # =========================================================
@@ -1081,7 +1069,6 @@ def get_account_state(con) -> Tuple[float, float, float]:
     return row[0], row[1], row[2]
 
 def detect_kline_patterns(open_s, high_s, low_s, close_s) -> Tuple[str, float, str, float]:
-    # Returns (BullishPatternName, BullishScore, BearishPatternName, BearishScore)
     o = open_s.values.astype(float)
     h = high_s.values.astype(float)
     l = low_s.values.astype(float)
@@ -1125,10 +1112,9 @@ def detect_kline_patterns(open_s, high_s, low_s, close_s) -> Tuple[str, float, s
                             bull_patterns.append(cn_name)
                         elif res[-1] < 0:
                             bear_patterns.append(cn_name)
-                except:
+                except Exception:
                     pass
 
-    # Custom patterns
     if len(c) >= 3:
         prev_body = abs(o[-2] - c[-2])
         if c[-2] < o[-2] and prev_body > (c[-2] * 0.03):
@@ -1137,7 +1123,7 @@ def detect_kline_patterns(open_s, high_s, low_s, close_s) -> Tuple[str, float, s
             if o[-1] < c[-2] and abs(c[-1] - c[-2]) / c[-2] < 0.005:
                 bull_patterns.append("好友反攻")
         if all(c[i] > o[i] for i in range(-3, 0)) and c[-1] > c[-2] > c[-3]:
-            bull_patterns.append("由于连阳")
+            bull_patterns.append("三连阳")
             
     body = abs(c[-1] - o[-1])
     upper = h[-1] - max(o[-1], c[-1])
@@ -1156,27 +1142,40 @@ def detect_kline_patterns(open_s, high_s, low_s, close_s) -> Tuple[str, float, s
     
     return bull_text, min(len(bull_patterns), 5.0), bear_text, min(len(bear_patterns), 5.0)
 
-def _is_market_healthy(con, trade_date: date, index_symbol="000001.SH") -> bool:
-    """大盘近5日趋势判断：MA5 > MA20 视为健康"""
+
+# ── 3. 大盘环境多级仓位管理 (Regime Switching) ──
+def get_market_target_position_ratio(con, trade_date: date, index_symbol="000001.SH") -> float:
+    """
+    根据大盘趋势计算目标持仓上限比例：
+    - 强趋势市 (MA5 >= MA20)：允许最高 100% 满仓
+    - 震荡/弱趋势市 (MA5 >= MA20 * 0.98)：允许最高 50% 仓位
+    - 弱势/熊市 (MA5 < MA20 * 0.98)：总仓位上限压缩至 30%
+    """
     if not CONFIG.get("market_health_check", True):
-        return True
+        return 1.0
     df = con.execute("""
         SELECT date, close FROM daily_qfq_cache
         WHERE symbol = ? AND date <= ?
         ORDER BY date DESC LIMIT 20
     """, [index_symbol, trade_date]).df()
     if len(df) < 20:
-        return True   # 数据不足时默认放行
+        return 1.0
     ma5  = df["close"].iloc[:5].mean()
     ma20 = df["close"].mean()
-    return ma5 >= ma20 * 0.995
-def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tuple]]:
-    if not _is_market_healthy(con, trade_date):
-        log.info(f"⚠️ 大盘弱势 ({trade_date})，暂停新订单成交")
-        return [], []
+    if ma5 >= ma20:
+        return 1.0
+    elif ma5 >= ma20 * 0.98:
+        return 0.5
+    else:
+        return 0.3
 
+
+def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tuple]]:
+    # 依据大盘多级环境获取目标持仓上限比例
+    market_pos_ratio = get_market_target_position_ratio(con, trade_date)
+    
     pending_df = con.execute("""
-        SELECT symbol, signal_date, planned_buy_price, signal_close, trade_type, status, signal_strength
+        SELECT symbol, signal_date, planned_buy_price, signal_close, trade_type, status, signal_strength, atr_pct
         FROM pending_orders
         WHERE status=0 AND signal_date < ?
     """, [trade_date]).df()
@@ -1189,18 +1188,33 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
         return [], []
         
     init_cap, total_assets, avail_cash = get_account_state(con)
-    # Check reset condition
     if total_assets <= 0:
         log.warning(f"资产归零或异常，执行重置恢复至{CONFIG.get('init_cash', 100000.0)}初始资金")
         init_cap = total_assets = avail_cash = float(CONFIG.get("init_cash", 100000.0))
         con.execute("DELETE FROM virtual_portfolio")
         con.execute("UPDATE account_state SET init_capital=?, total_assets=?, available_cash=? WHERE id=1", [init_cap, total_assets, avail_cash])
 
-    # 每只股票的目标资金：取 CONFIG 配置值与动态均分资金中的较小值
-    position_cash_yuan = min(CONFIG['position_cash_yuan'], total_assets / max(1, CONFIG['top_n']))
+    # ── 动态风险平价 (Risk Parity) + 大盘环境多级仓位 ──
+    max_position = int(CONFIG.get("max_position_stocks", 5))
     buy_fee_rate = float(CONFIG.get("buy_fee_rate", 0.0005))
     
-    # 提前拉取近期数据计算 T+1 过滤所需的 MA20, vol_ma5, MACD
+    # 大盘允许分配的最大股票市值上限
+    max_allowed_stock_equity = total_assets * market_pos_ratio
+    # 当前已持有的市值
+    current_market_val = con.execute("""
+        SELECT COALESCE(SUM(p.shares * s.close), 0)
+        FROM virtual_portfolio p
+        JOIN stock_prices s ON p.symbol = s.symbol AND s.tradedate = ?
+    """, [trade_date]).fetchone()[0]
+    
+    # 如果当前持仓已达大盘多级仓位上限，停止买入新股票
+    if current_market_val >= max_allowed_stock_equity:
+        log.info(f"🛡️ 当前持仓市值 (¥{current_market_val:,.0f}) 已达大盘环境受控上限 ({market_pos_ratio*100:.0f}%)，暂停新建仓")
+        return [], []
+
+    # 基准单仓预算
+    base_stock_budget = min(CONFIG['position_cash_yuan'], total_assets / max_position)
+    
     symbols = pending_df['symbol'].tolist()
     placeholders = ','.join(['?'] * len(symbols))
     start_date_60 = (trade_date - timedelta(days=90)).strftime('%Y-%m-%d')
@@ -1218,7 +1232,6 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
     vol_ratio_min = float(CONFIG.get("buy_confirm_vol_ratio_min", 0.5))
     ma20_margin = float(CONFIG.get("buy_confirm_ma20_margin", 0.99))
     expire_days = int(CONFIG.get("buy_signal_expire_days", 2))
-    max_position = int(CONFIG.get("max_position_stocks", 10))
     
     current_holdings = con.execute("SELECT COUNT(*) FROM virtual_portfolio").fetchone()[0]
     
@@ -1227,8 +1240,8 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
         symbol = row['symbol']
         signal_date = row['signal_date']
         planned_buy_price = float(row['planned_buy_price'])
+        atr_pct = float(row['atr_pct']) if 'atr_pct' in row and not pd.isna(row['atr_pct']) and float(row['atr_pct']) > 0 else 0.03
         
-        # 1. 信号衰减过滤
         days_elapsed = (trade_date - pd.to_datetime(signal_date).date()).days
         if days_elapsed > expire_days:
             expired_rows.append((symbol, signal_date))
@@ -1244,37 +1257,31 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
         today_close_qfq = float(row_t1['close'])
         today_vol_qfq = float(row_t1['volume'])
         today_close_hfq = float(h_map[symbol]['close']) if symbol in h_map else today_close_qfq
-        signal_close = float(row['signal_close']) if not pd.isna(row['signal_close']) else planned_buy_price / get_buy_trigger_pct()
+        signal_close = float(row['signal_close']) if not pd.isna(row['signal_close']) else planned_buy_price
         
-        # 2. T+1 日内跌幅过滤
         day_ret = (today_close_qfq - today_open_qfq) / today_open_qfq if today_open_qfq > 0 else 0
         if day_ret < day_drop_limit:
             expired_rows.append((symbol, signal_date))
             continue
             
-        # 计算历史指标
         sym_hist = hist_df[hist_df['symbol'] == symbol].copy()
         if len(sym_hist) < 20:
             expired_rows.append((symbol, signal_date))
             continue
             
         ma20_t1 = float(sym_hist['close'].tail(20).mean())
-        # T日的5日均量
         vol_ma5_prev = float(sym_hist['volume'].iloc[:-1].tail(5).mean()) if len(sym_hist) > 5 else 0.0
         
-        # 3. 量能萎缩过滤
         if vol_ma5_prev > 0:
             vol_ratio = today_vol_qfq / vol_ma5_prev
             if vol_ratio < vol_ratio_min:
                 expired_rows.append((symbol, signal_date))
                 continue
                 
-        # 4. MA20 支撑过滤
         if today_close_qfq < ma20_t1 * ma20_margin:
             expired_rows.append((symbol, signal_date))
             continue
             
-        # 5. MACD 方向确认
         if talib is not None and len(sym_hist) >= 40:
             c_vals = sym_hist['close'].values.astype(np.float64)
             macd, macdsignal, macdhist = talib.MACD(c_vals, fastperiod=12, slowperiod=26, signalperiod=9)
@@ -1283,15 +1290,19 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
                     expired_rows.append((symbol, signal_date))
                     continue
         
-        # Determine if budget allows buying
-        if avail_cash >= position_cash_yuan * 0.5 and current_holdings < max_position:  # ensure at least 50% of intended budget is available
-            cost_yuan_budget = min(position_cash_yuan, avail_cash)
+        # ── 风险平价 (Risk Parity) 计算个股目标资金 ──
+        # 标杆波动率 3.0%，高波股票少分资金，低波股票多分资金，权重范围限制在 [0.5, 2.0]
+        risk_weight = np.clip(0.03 / atr_pct, 0.5, 2.0)
+        target_stock_cash = base_stock_budget * risk_weight
+
+        if avail_cash >= target_stock_cash * 0.5 and current_holdings < max_position:
+            cost_yuan_budget = min(target_stock_cash, avail_cash)
         else:
             expired_rows.append((symbol, signal_date))
             continue
 
         signal_strength = float(row['signal_strength']) if 'signal_strength' in row and not pd.isna(row['signal_strength']) else 0.0
-        HIGH_CONFIDENCE = 2.0  # 综合打分阈值
+        HIGH_CONFIDENCE = 2.0
 
         actual_buy_price_qfq = None
         if today_low_qfq <= planned_buy_price:
@@ -1303,7 +1314,6 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
             factor = (today_close_hfq / today_close_qfq) if today_close_qfq > 0 else 1.0
             buy_price_hfq = round(actual_buy_price_qfq * factor, 2)
             
-            # Request: A股股数全是整百，不存在碎股
             lot_cost = actual_buy_price_qfq * 100.0 * (1.0 + buy_fee_rate)
             shares = int(cost_yuan_budget / lot_cost) * 100
             if shares < 100:
@@ -1324,17 +1334,17 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
             
             avail_cash -= actual_cost
             current_holdings += 1
-            filled_rows.append((symbol, trade_date, actual_buy_price_qfq, buy_price_hfq, int(shares), float(buy_fee)))
+            filled_rows.append((symbol, trade_date, actual_buy_price_qfq, buy_price_hfq, int(shares), float(buy_fee), atr_pct))
         else:
             expired_rows.append((symbol, signal_date))
             
     if filled_rows:
         con.execute("UPDATE account_state SET available_cash=? WHERE id=1", [avail_cash])
         con.executemany("""
-            INSERT OR REPLACE INTO virtual_portfolio(symbol, buy_date, buy_price, buy_price_hfq, shares)
-            VALUES (?, ?, ?, ?, ?)
-        """, [(s, d, bp, bph, sh) for s, d, bp, bph, sh, _ in filled_rows])
-        for symbol, buy_date, buy_price, buy_price_hfq, shares, buy_fee in filled_rows:
+            INSERT OR REPLACE INTO virtual_portfolio(symbol, buy_date, buy_price, buy_price_hfq, shares, atr_pct_buy)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, [(s, d, bp, bph, sh, atr) for s, d, bp, bph, sh, _, atr in filled_rows])
+        for symbol, buy_date, buy_price, buy_price_hfq, shares, buy_fee, _ in filled_rows:
             con.execute(f"UPDATE pending_orders SET status={STATUS_FILLED} WHERE symbol=? AND status={STATUS_PENDING}", [symbol])
             con.execute("""
                 INSERT INTO trade_history(symbol, trade_type, signal_date, trade_date, price, shares, reason, pnl_pct, fee)
@@ -1343,14 +1353,15 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
     if expired_rows:
         con.executemany(f"UPDATE pending_orders SET status={STATUS_EXPIRED} WHERE symbol=? AND signal_date=? AND status={STATUS_PENDING}", expired_rows)
     return filled_rows, expired_rows
+
+
 def process_exit_rules(con, trade_date: date) -> List[Tuple]:
-    holdings = con.execute("SELECT symbol, buy_date, buy_price, buy_price_hfq, shares FROM virtual_portfolio").df()
+    holdings = con.execute("SELECT symbol, buy_date, buy_price, buy_price_hfq, shares, atr_pct_buy FROM virtual_portfolio").df()
     if holdings.empty:
         return []
     holdings["buy_date"] = pd.to_datetime(holdings["buy_date"], errors="coerce")
     holdings = holdings[holdings["buy_date"].notna()].copy()
     holdings["buy_date"] = holdings["buy_date"].dt.date
-    # T+1 约束：当日刚成交的买入不能在当天再次触发卖出。
     holdings = holdings[holdings["buy_date"] < trade_date].copy()
     if holdings.empty:
         return []
@@ -1380,7 +1391,7 @@ def process_exit_rules(con, trade_date: date) -> List[Tuple]:
         WHERE symbol IN ({placeholders}) AND date BETWEEN ? AND ?
         ORDER BY symbol, date
     """, symbols + [start_date, trade_date.strftime('%Y-%m-%d')]).df()
-    # 获取当日原始价格（用于计算卖出回收现金）
+    
     raw_today = con.execute(f"SELECT symbol, close FROM {STOCKS_TABLE} WHERE tradedate = ?", [trade_date]).df()
     if not raw_today.empty:
         raw_today["symbol"] = raw_today["symbol"].map(canonical_symbol)
@@ -1393,12 +1404,16 @@ def process_exit_rules(con, trade_date: date) -> List[Tuple]:
     sold_rows = []
     init_cap, total_assets, avail_cash = get_account_state(con)
     sell_fee_rate = float(CONFIG.get("sell_fee_rate", 0.0010))
+    atr_stop_beta = float(CONFIG.get("atr_stop_loss_beta", 2.0))
+    
     for _, row in holdings.iterrows():
         sym = row['symbol']
         buy_date = pd.to_datetime(row['buy_date']).date()
         buy_price = float(row['buy_price'])
         buy_price_hfq = float(row['buy_price_hfq']) if not pd.isna(row['buy_price_hfq']) else buy_price
-        shares = int(row['shares'])  # 整百股
+        shares = int(row['shares'])
+        atr_pct_buy = float(row['atr_pct_buy']) if 'atr_pct_buy' in row and not pd.isna(row['atr_pct_buy']) and float(row['atr_pct_buy']) > 0 else 0.03
+        
         gq = qfq_df[qfq_df['symbol'] == sym].copy()
         if gq.empty:
             continue
@@ -1412,8 +1427,9 @@ def process_exit_rules(con, trade_date: date) -> List[Tuple]:
         pnl_pct = (last_close_hfq - buy_price_hfq) / buy_price_hfq * 100 if buy_price_hfq > 0 else 0.0
         reason_mask = 0
         
-        # 移除止盈比例检查，保留止损
-        if pnl_pct <= CONFIG['stop_loss_pct']:
+        # ── 动态 ATR 触发止损逻辑 ──
+        dynamic_stop_loss_limit_pct = -1.0 * atr_stop_beta * atr_pct_buy * 100.0
+        if pnl_pct <= dynamic_stop_loss_limit_pct:
             reason_mask |= REASON_STOPLOSS
             
         last_close_f = float(last_q['close'])
@@ -1426,11 +1442,9 @@ def process_exit_rules(con, trade_date: date) -> List[Tuple]:
         if hold_days >= CONFIG['max_hold_days']:
             reason_mask |= REASON_MAX_HOLD
 
-        # 布林带形态卖出：跌破布林中轨或下轨
         if last_mid > 0 and prev_close_f > last_mid and last_close_f < last_mid:
             reason_mask |= REASON_BELOW_BOLL_MID
             
-        # K线形态卖出：含有明确的下跌形态
         o_s = gq['open'].astype(float).tail(15)
         h_s = gq['high'].astype(float).tail(15)
         l_s = gq['low'].astype(float).tail(15)
@@ -1448,8 +1462,7 @@ def process_exit_rules(con, trade_date: date) -> List[Tuple]:
                     reason_mask |= REASON_MACD_DECREASE
                     
         if reason_mask > 0:
-            # 使用原始价格计算卖出回收现金（不折价，以信号当天收盘价卖出）
-            sell_price_raw = raw_map.get(sym, last_close_qfq)  # 优先用raw，否则用qfq
+            sell_price_raw = raw_map.get(sym, last_close_qfq)
             sold_rows.append((sym, trade_date, last_close_qfq, shares, reason_mask, round(pnl_pct, 2), sell_price_raw))
             
     for sym, sell_date, sell_price, shares, reason_mask, pnl_pct, sell_price_raw in sold_rows:
@@ -1466,22 +1479,37 @@ def process_exit_rules(con, trade_date: date) -> List[Tuple]:
     if sold_rows:
         con.execute("UPDATE account_state SET available_cash=? WHERE id=1", [avail_cash])
     return sold_rows
+
+
 def compute_all_signals(con, target_date: date) -> pd.DataFrame:
-    # 采用 DuckDB 窗口函数计算核心指标，并只提取符合条件的候选股票，极大降低内存占用
     start_date = (target_date - timedelta(days=120)).strftime("%Y-%m-%d")
     end_date = target_date.strftime("%Y-%m-%d")
+    atr_alpha = float(CONFIG.get("atr_buy_alpha", 0.5))
     
+    # SQL 引入 ATR(14) 指标计算
     query = """
-    WITH indicators AS (
-        SELECT symbol, date, close, volume,
+    WITH raw_data AS (
+        SELECT symbol, date, high, low, close, volume,
+               LAG(close, 1) OVER (PARTITION BY symbol ORDER BY date) AS prev_close
+        FROM daily_qfq_cache
+        WHERE date BETWEEN ? AND ?
+    ),
+    tr_data AS (
+        SELECT *,
+               GREATEST(high - low, ABS(high - COALESCE(prev_close, close)), ABS(low - COALESCE(prev_close, close))) AS tr
+        FROM raw_data
+    ),
+    indicators AS (
+        SELECT symbol, date, high, low, close, volume,
+               AVG(tr) OVER w14 AS atr14,
                AVG(close) OVER w20 AS ma20,
                STDDEV(close) OVER w20 AS std20,
                AVG(volume) OVER w5 AS vol_ma5,
                LAG(close, 5) OVER w AS close_5,
                LAG(close, 20) OVER w AS close_20
-        FROM daily_qfq_cache
-        WHERE date BETWEEN ? AND ?
+        FROM tr_data
         WINDOW 
+            w14 AS (PARTITION BY symbol ORDER BY date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW),
             w20 AS (PARTITION BY symbol ORDER BY date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW),
             w5 AS (PARTITION BY symbol ORDER BY date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW),
             w AS (PARTITION BY symbol ORDER BY date)
@@ -1502,7 +1530,7 @@ def compute_all_signals(con, target_date: date) -> pd.DataFrame:
         FROM derived
         WINDOW w AS (PARTITION BY symbol ORDER BY date)
     )
-    SELECT symbol, date, close, volume, ma20, std20, vol_ma5, close_5, close_20,
+    SELECT symbol, date, close, volume, ma20, std20, atr14, vol_ma5, close_5, close_20,
            band_width, band_width_1, band_width_2, ma20_1, ma20_2, vol_ma5_1
     FROM derived2 
     WHERE date = ? 
@@ -1513,6 +1541,7 @@ def compute_all_signals(con, target_date: date) -> pd.DataFrame:
       AND volume > vol_ma5_1
       AND close > 0
       AND ma20 IS NOT NULL
+      AND atr14 IS NOT NULL
     """
     candidates = con.execute(query, [start_date, end_date, end_date]).df()
     candidates['close'] = candidates['close'].astype(np.float64)
@@ -1521,7 +1550,6 @@ def compute_all_signals(con, target_date: date) -> pd.DataFrame:
         
     symbols = candidates['symbol'].tolist()
     placeholders = ','.join(['?'] * len(symbols))
-    # Fetch 40 days history to compute MACD only for candidate symbols
     macd_start = (target_date - timedelta(days=60)).strftime("%Y-%m-%d")
     hist_df = con.execute(f"""
         SELECT symbol, date, open, high, low, close 
@@ -1569,8 +1597,12 @@ def compute_all_signals(con, target_date: date) -> pd.DataFrame:
     picks["vol_ratio"] = np.where(picks["vol_ma5_1"] > 0, picks["volume"] / picks["vol_ma5_1"], 1.0)
     picks["bb_breakout"] = np.where(picks["band_width"] > 0, (picks["close"] - picks["lower"]) / picks["band_width"], 0.0)
     
-    buy_pct = get_buy_trigger_pct()
-    picks["planned_buy_price"] = (picks["close"] * buy_pct).round(2)
+    # ── 动态 ATR 挂单价计算：挂单价 = 收盘价 - alpha * ATR(14) ──
+    picks["atr_pct"] = (picks["atr14"] / picks["close"]).round(4)
+    picks["planned_buy_price"] = (picks["close"] - atr_alpha * picks["atr14"]).round(2)
+    # 防御边界处理
+    picks["planned_buy_price"] = np.where(picks["planned_buy_price"] <= 0, (picks["close"] * 0.99).round(2), picks["planned_buy_price"])
+    
     picks["total_score"] = (picks["ret_20d"] * 100.0).round(2)
     picks["signal_strength"] = (picks["macd_strength"] + picks["vol_ratio"] + picks["bb_breakout"]).round(2)
     picks["close"] = picks["close"].round(2)
@@ -1578,10 +1610,10 @@ def compute_all_signals(con, target_date: date) -> pd.DataFrame:
     picks["date"] = pd.to_datetime(picks["date"]).dt.date
     
     if not CONFIG.get("filter_gem_star", True):
-        # 如果不纳入创业板（300, 301）、科创板（688）
         picks = picks[~picks["symbol"].str.contains("^(?:300|301|688)")].copy()
     
-    return picks[["symbol", "date", "close", "planned_buy_price", "ret_5d", "ret_20d", "total_score", "signal_strength", "kline_pattern", "vol_bb_break"]]
+    return picks[["symbol", "date", "close", "planned_buy_price", "atr_pct", "ret_5d", "ret_20d", "total_score", "signal_strength", "kline_pattern", "vol_bb_break"]]
+
 
 def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = None, allow_exit_on_date: bool = True):
     top_n = top_n or CONFIG["top_n"]
@@ -1599,7 +1631,6 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
         if not df_picks.empty:
             df_picks = df_picks.sort_values(["total_score", "symbol"], ascending=[False, True]).head(top_n).reset_index(drop=True)
 
-        # ── 挂单逻辑：清除旧挂单，仅从当日候选票中挂单 ──
         con.execute(f"UPDATE pending_orders SET status={STATUS_EXPIRED} WHERE status={STATUS_PENDING}")
         holdings_df = con.execute("SELECT symbol FROM virtual_portfolio").df()
         holding_symbols = set(holdings_df["symbol"]) if not holdings_df.empty else set()
@@ -1609,27 +1640,26 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
                 symbol = row["symbol"]
                 if symbol in holding_symbols:
                     continue
-                new_orders.append((symbol, target_date, round(float(row["planned_buy_price"]), 2), round(float(row["close"]), 2), TRADE_BUY, STATUS_PENDING, float(row["signal_strength"])))
+                atr_p = float(row["atr_pct"]) if "atr_pct" in row and not pd.isna(row["atr_pct"]) else 0.03
+                new_orders.append((symbol, target_date, round(float(row["planned_buy_price"]), 2), round(float(row["close"]), 2), TRADE_BUY, STATUS_PENDING, float(row["signal_strength"]), atr_p))
             if new_orders:
                 con.executemany("""
-                    INSERT OR REPLACE INTO pending_orders(symbol, signal_date, planned_buy_price, signal_close, trade_type, status, signal_strength)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO pending_orders(symbol, signal_date, planned_buy_price, signal_close, trade_type, status, signal_strength, atr_pct)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, new_orders)
 
         df_pending = con.execute(f"""
-            SELECT symbol, signal_date, planned_buy_price, signal_close, trade_type, status, signal_strength
+            SELECT symbol, signal_date, planned_buy_price, signal_close, trade_type, status, signal_strength, atr_pct
             FROM pending_orders
             WHERE status={STATUS_PENDING}
             ORDER BY signal_date DESC, symbol
         """).df()
 
-        # ── 持仓与市值计算（使用原始价格）──
         holdings = con.execute("SELECT * FROM virtual_portfolio ORDER BY symbol").df()
         if holdings.empty:
             df_portfolio = pd.DataFrame()
             total_market_value = 0.0
         else:
-            # 使用原始价格计算市值（非复权价格）
             raw_today_df = con.execute(f"SELECT symbol, close FROM {STOCKS_TABLE} WHERE tradedate = ?", [target_date]).df()
             if not raw_today_df.empty:
                 raw_today_df["symbol"] = raw_today_df["symbol"].map(canonical_symbol)
@@ -1638,22 +1668,18 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
             df_portfolio = df_portfolio.merge(hfq_today_df.rename(columns={"close": "last_price_hfq"}), on="symbol", how="left")
             df_portfolio["last_price"] = df_portfolio["last_price"].fillna(df_portfolio["buy_price"])
             df_portfolio["last_price_hfq"] = df_portfolio["last_price_hfq"].fillna(df_portfolio["buy_price_hfq"].fillna(df_portfolio["buy_price"]))
-            # 股数强制为整百（四舍五入到最近的100）
             df_portfolio["shares"] = (np.round(df_portfolio["shares"].astype(float) / 100) * 100).astype(int)
-            # 过滤不足100股的无效持仓（清理历史脏数据）
             invalid_symbols = df_portfolio[df_portfolio["shares"] < 100]["symbol"].tolist()
             if invalid_symbols:
                 log.warning(f"⚠️ 过滤不足100股的无效持仓: {invalid_symbols}")
                 for sym in invalid_symbols:
                     con.execute("DELETE FROM virtual_portfolio WHERE symbol=?", [sym])
                 df_portfolio = df_portfolio[df_portfolio["shares"] >= 100].copy()
-            # 使用原始价格计算市值
             df_portfolio["market_value"] = (df_portfolio["last_price"].astype(float) * df_portfolio["shares"]).astype(float)
             df_portfolio["cost"] = (df_portfolio["buy_price"].astype(float) * df_portfolio["shares"]).astype(float)
             df_portfolio["pnl_pct"] = (df_portfolio["last_price_hfq"] - df_portfolio["buy_price_hfq"].fillna(df_portfolio["buy_price"])) / df_portfolio["buy_price_hfq"].fillna(df_portfolio["buy_price"]) * 100
             df_portfolio["holding_days"] = df_portfolio["buy_date"].apply(lambda x: (target_date - pd.to_datetime(x).date()).days)
             
-            # 生成持仓建议
             advice_list = []
             for r in df_portfolio.itertuples():
                 if r.pnl_pct > CONFIG["take_profit_pct"] * 0.8:
@@ -1668,7 +1694,6 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
             
             total_market_value = df_portfolio["market_value"].sum()
 
-        # Account tracking update
         init_cap, _, avail_cash = get_account_state(con)
         new_total_assets = avail_cash + total_market_value
         con.execute("UPDATE account_state SET total_assets=?, updated_at=? WHERE id=1", [new_total_assets, target_date])
@@ -1683,7 +1708,6 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
             VALUES (?, ?, ?, ?, ?, ?)
         """, [target_date, round(new_total_assets, 2), round(avail_cash, 2), round(daily_pnl, 2), round(daily_ret, 4), round(total_market_value, 2)])
 
-        # ── 绩效指标计算 ──
         chart_b64 = None
         sharpe = 0.0
         max_drawdown = 0.0
@@ -1694,14 +1718,12 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
         if len(hist_df) >= 2:
             try:
                 hist_df['date'] = pd.to_datetime(hist_df['date'])
-                # 夏普比率（无风险利率 1.8%，日化）
                 rf_annual = 0.018
                 rf_daily = rf_annual / 252
                 mean_ret = hist_df['daily_ret'].mean()
                 std_ret = hist_df['daily_ret'].std()
                 sharpe = (mean_ret - rf_daily) / std_ret * np.sqrt(252) if std_ret > 0 else 0
 
-                # 最大回撤
                 assets_arr = hist_df['total_assets'].values
                 peak = assets_arr[0]
                 for v in assets_arr:
@@ -1711,15 +1733,12 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
                     if dd > max_drawdown:
                         max_drawdown = dd
 
-                # 年化收益率
                 n_days = len(hist_df)
                 total_ret = (new_total_assets / init_cap) - 1.0
                 annual_ret = (1 + total_ret) ** (252 / max(n_days, 1)) - 1.0
 
-                # 收益回撤比（Calmar Ratio）
                 calmar = annual_ret / max_drawdown if max_drawdown > 0 else 0.0
 
-                # 绘图
                 plt.figure(figsize=(10, 4))
                 ax1 = plt.subplot(1, 1, 1)
                 ax1.plot(hist_df['date'], hist_df['total_assets'] / init_cap, color='#3b82f6', linewidth=2, label='Portfolio Net Value')
@@ -1755,6 +1774,7 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
         df_trades = con.execute("SELECT * FROM trade_history WHERE trade_date = ? ORDER BY trade_type, symbol", [target_date]).df()
         apply_history_retention(con)
     return decode_numeric_frame(df_picks), decode_numeric_frame(df_portfolio), decode_numeric_frame(df_pending), decode_numeric_frame(df_trades), metrics
+
 # =========================================================
 # 报告邮件
 # =========================================================
@@ -1793,9 +1813,6 @@ def send_email_via_graph(tm: TokenManager, subject: str, html_body: str, attachm
             log.warning(f"⚠️ 发送邮件尝试 {attempt} 失败，将重试: {e}")
             time.sleep(attempt * 2)
 
-# =========================================================
-# 报告邮件（美化版）
-# =========================================================
 def _market_badge(symbol: str) -> str:
     market = symbol_market(symbol)
     code = symbol_code(symbol)
@@ -1812,32 +1829,27 @@ def _market_badge(symbol: str) -> str:
     if market == "bj" or code.startswith("920"):
         return f'<span class="badge badge-bj">北交</span> {code}'
     return f'<span class="badge badge-sz">{symbol}</span>'
-def _score_bar(value: float, max_val: float = 1180.0) -> str:
-    pct = min(int(value / max_val * 100), 100)
-    return (
-        f'<div class="score-bar-wrap">'
-        f'<div class="score-bar"><div class="score-fill" style="width:{pct}%"></div></div>'
-        f'<span class="score-text">{value:.1f}</span>'
-        f'</div>'
-    )
+
 def _ret_cell(v: float) -> str:
     sign = "+" if v >= 0 else ""
     cls = "ret-pos" if v >= 0 else "ret-neg"
     return f'<span class="{cls}">{sign}{v*100:.1f}%</span>'
+
 def _picks_table(df: pd.DataFrame) -> str:
     if df is None or df.empty:
         return '<div class="empty-state"><div class="empty-icon">📭</div><div>今日无候选股票</div></div>'
-    max_score = float(df["total_score"].max()) if not df.empty and "total_score" in df.columns else 1.0
     rows = []
     for i, r in enumerate(df.itertuples(), 1):
         kline_p = getattr(r, "kline_pattern", "")
         bb_break = getattr(r, "vol_bb_break", "")
+        atr_pct_val = float(getattr(r, "atr_pct", 0.03)) * 100
         rows.append(f"""
         <tr>
           <td>{i}</td>
           <td>{_market_badge(r.symbol)}</td>
           <td>¥{float(r.close):.2f}</td>
           <td>¥{float(r.planned_buy_price):.2f}</td>
+          <td>{atr_pct_val:.2f}%</td>
           <td>{kline_p or '—'}</td>
           <td>{bb_break or '—'}</td>
           <td>{_ret_cell(getattr(r, 'ret_5d', 0.0))}</td>
@@ -1846,39 +1858,41 @@ def _picks_table(df: pd.DataFrame) -> str:
     return f"""
     <table class="data-table">
       <thead><tr>
-                <th>#</th><th>代码</th><th>收盘价</th><th>挂单价</th>
-                <th>K线形态</th><th>量价共振</th>
+                <th>#</th><th>代码</th><th>收盘价</th><th>动态ATR挂单价</th>
+                <th>ATR(14)波幅</th><th>K线形态</th><th>量价共振</th>
                 <th>5日涨幅</th><th>20日涨幅</th>
       </tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table>"""
+
 def _pending_table(df: pd.DataFrame) -> str:
     if df is None or df.empty:
         return '<div class="empty-state"><div class="empty-icon">📭</div><div>暂无待成交挂单</div></div>'
     rows = []
     for r in df.itertuples():
-                pbp = float(r.planned_buy_price)  # 挂单价
-                sc = float(r.signal_close) if not pd.isna(r.signal_close) else pbp
-                disc = (pbp - sc) / sc * 100 if sc else 0.0
-                type_str = decode_trade_type_label(getattr(r, 'trade_type', TRADE_BUY))
-                rows.append(f"""
-                <tr>
-                    <td>{_market_badge(r.symbol)}</td>
-                    <td>{type_str}</td>
-                    <td>{r.signal_date}</td>
-                    <td>¥{pbp:.2f}</td>
-                    <td>¥{sc:.2f}</td>
-                    <td><span class="ret-neg">{disc:.2f}%</span></td>
-                    <td><span class="badge badge-pending">⏳ 待成交</span></td>
-                </tr>""")
+        pbp = float(r.planned_buy_price)
+        sc = float(r.signal_close) if not pd.isna(r.signal_close) else pbp
+        disc = (pbp - sc) / sc * 100 if sc else 0.0
+        type_str = decode_trade_type_label(getattr(r, 'trade_type', TRADE_BUY))
+        rows.append(f"""
+        <tr>
+            <td>{_market_badge(r.symbol)}</td>
+            <td>{type_str}</td>
+            <td>{r.signal_date}</td>
+            <td>¥{pbp:.2f}</td>
+            <td>¥{sc:.2f}</td>
+            <td><span class="ret-neg">{disc:.2f}%</span></td>
+            <td><span class="badge badge-pending">⏳ 待成交</span></td>
+        </tr>""")
     return f"""
     <table class="data-table">
       <thead><tr>
         <th>代码</th><th>方向</th><th>信号日期</th><th>挂单价</th>
-        <th>信号收盘</th><th>折价幅度</th><th>状态</th>
+        <th>信号收盘</th><th>回调幅度</th><th>状态</th>
       </tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table>"""
+
 def _trades_table(df: pd.DataFrame) -> str:
     if df is None or df.empty:
         return '<div class="empty-state"><div class="empty-icon">📭</div><div>今日暂无成交记录</div></div>'
@@ -1897,7 +1911,7 @@ def _trades_table(df: pd.DataFrame) -> str:
           <td>{_market_badge(r.symbol)}</td>
           <td>{type_label}</td>
           <td>{r.trade_date}</td>
-                    <td>¥{float(r.price):.2f}</td>
+          <td>¥{float(r.price):.2f}</td>
           <td>{shares_display}</td>
           <td>{reason_display or '—'}</td>
           <td>{pnl or '—'}</td>
@@ -1910,6 +1924,7 @@ def _trades_table(df: pd.DataFrame) -> str:
       </tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table>"""
+
 def _portfolio_table(df: pd.DataFrame) -> str:
     if df is None or df.empty:
         return '<div class="empty-state"><div class="empty-icon">🏦</div><div>当前无持仓，满仓观望</div></div>'
@@ -1938,6 +1953,7 @@ def _portfolio_table(df: pd.DataFrame) -> str:
       </tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table>"""
+
 def generate_and_send_report(
     tm: TokenManager,
     df_picks: pd.DataFrame,
@@ -2007,10 +2023,6 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
 .data-table tbody tr:hover { background:#fafbfc; }
 .data-table tbody tr:last-child td { border-bottom:none; }
 .table-wrap { overflow-x:auto; -webkit-overflow-scrolling:touch; }
-.score-bar-wrap { display:flex; align-items:center; gap:8px; }
-.score-bar  { height:6px; border-radius:3px; background:#e2e8f0; flex:1; min-width:60px; }
-.score-fill { height:6px; border-radius:3px; background:linear-gradient(90deg,#3b82f6,#8b5cf6); }
-.score-text { font-weight:600; color:#1e293b; min-width:48px; text-align:right; font-size:12px; }
 .badge        { display:inline-block; padding:2px 8px; border-radius:4px;
                 font-size:11px; font-weight:600; white-space:nowrap; }
 .badge-sh     { background:#fee2e2; color:#b91c1c; }
@@ -2020,13 +2032,11 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
 .badge-zx     { background:#cffafe; color:#155e75; }
 .badge-bj     { background:#ffedd5; color:#9a3412; }
 .badge-pending{ background:#fffbeb; color:#b45309; border:1px solid #fde68a; }
-.badge-bb     { background:#ede9fe; color:#6d28d9; border:1px solid #c4b5fd; }
 .ret-pos { color:#16a34a; font-weight:600; }
 .ret-neg { color:#dc2626; font-weight:600; }
 .empty-state { text-align:center; padding:32px 16px; color:#94a3b8; font-size:14px; }
 .empty-icon  { font-size:32px; margin-bottom:8px; }
 .footer  { text-align:center; padding:20px; color:#94a3b8; font-size:12px; }
-/* ── 响应式适配 ── */
 @media screen and (max-width: 768px) {
   .wrapper { padding:10px; }
   .header { flex-direction:column; text-align:center; gap:12px; padding:20px 16px; }
@@ -2046,7 +2056,6 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
   .kpi-icon { font-size:18px; margin-bottom:4px; }
   .section { padding:12px 8px 10px; border-radius:10px; }
   .data-table th, .data-table td { padding:6px 4px; font-size:11px; }
-  .score-bar { min-width:40px; }
 }
 </style>"""
     html = f"""<!DOCTYPE html><html lang="zh-CN">
@@ -2055,7 +2064,7 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
 <div class="header">
   <div class="header-left">
     <h1>💴( $ _ $ ) A股量化日报</h1>
-    <div class="subtitle">布林带量价MACD共振策略 &nbsp;|&nbsp; 前复权信号 / 后复权止盈止损</div>
+    <div class="subtitle">布林带量价MACD共振 &nbsp;|&nbsp; 动态ATR挂单与止损 &nbsp;|&nbsp; 风险平价仓位</div>
   </div>
   <div class="header-badge">
     <div class="date">{target_str}</div>
@@ -2110,7 +2119,7 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
     <span class="section-count">{n_pending} 只</span>
   </div>
     <p style="font-size:12px;color:#64748b;margin-bottom:14px;">
-        规则：T+1 日最低价 ≤ 挂单价时成交（收盘价 × {get_buy_trigger_pct() * 100:.1f}%）</p>
+        规则：T+1 日最低价 ≤ 挂单价（收盘价 - {CONFIG['atr_buy_alpha']} × ATR14）才成交</p>
   <div class="table-wrap">{_pending_table(df_pending)}</div>
 </div>
 <!-- 4. 交易记录 -->
@@ -2129,19 +2138,18 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
     <div class="section-title">策略参数</div>
   </div>
   <div class="strategy-pills">
-    <span class="pill">每仓资金 ¥{CONFIG['position_cash_yuan']:,.0f}</span>
-    <span class="pill buy">买入：T+1 最低价 ≤ 收盘价 × {get_buy_trigger_pct() * 100:.1f}%</span>
-    <span class="pill sell">止盈 +{CONFIG['take_profit_pct']}%</span>
-    <span class="pill sell">止损 {CONFIG['stop_loss_pct']}%</span>
+    <span class="pill buy">挂单：T日收盘 - {CONFIG['atr_buy_alpha']}×ATR(14)</span>
+    <span class="pill sell">动态止损：-{CONFIG['atr_stop_loss_beta']}×ATR_pct</span>
+    <span class="pill">仓位：风险平价 Risk Parity</span>
+    <span class="pill">风控：大盘多级受控（100%/50%/30%）</span>
     <span class="pill sell">跌破 MA20 离场</span>
     <span class="pill sell">最长持有 {CONFIG['max_hold_days']} 天</span>
     <span class="pill">选股 Top {CONFIG['top_n']}</span>
-    <span class="pill">复权窗口 {CONFIG['adjust_cache_days']} 交易日</span>
   </div>
 </div>
 <div class="footer">
   <p>本报告由量化程序自动生成 · {target_str} 收盘后运行</p>
-        <p style="margin-top:4px;">数据来源：chenditc/investment_data (Qlib) · stocks 表 · 策略：布林带量价MACD共振 · 仅供参考，不构成投资建议</p>
+  <p style="margin-top:4px;">数据来源：chenditc/investment_data (Qlib) · stocks 表 · 策略：布林带量价MACD共振 + 动态ATR · 仅供参考，不构成投资建议</p>
 </div>
 </div></body></html>"""
     attachments = []
@@ -2154,6 +2162,7 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
             "contentBytes": content_bytes,
         })
     send_email_via_graph(tm, f"💴 CN量化日报 - {target_str}", html, attachments)
+
 # =========================================================
 # 主流程
 # =========================================================
@@ -2166,7 +2175,6 @@ def _latest_trade_date_in_db(con, target_date: date) -> Optional[date]:
 
 def run_strategy_with_replay_if_needed(db_path: str, target_date: date):
     with duckdb.connect(db_path) as con:
-        # 仅清理临时缓存表（每次重建），保留持仓/账户等持久表
         drop_cache_tables(con)
         ensure_core_tables(con)
         ensure_strategy_tables(con)
@@ -2176,12 +2184,10 @@ def run_strategy_with_replay_if_needed(db_path: str, target_date: date):
         has_history = con.execute("SELECT COUNT(*) FROM account_history").fetchone()[0] > 0
 
     if has_history:
-        # 日常模式：已有策略数据，仅计算最新交易日
         log.info("⚡ 日常模式：仅计算最新交易日策略")
         rebuild_recent_adjusted_cache(db_path, latest_trade_date, CONFIG["adjust_cache_days"])
         return latest_trade_date, evaluate_strategy(db_path, latest_trade_date, CONFIG["top_n"], allow_exit_on_date=True)
 
-    # 首次模式：无策略数据，回放最近N个交易日
     with duckdb.connect(db_path) as con:
         replay_dates = get_recent_trade_dates(con, latest_trade_date, int(CONFIG["initial_replay_trade_days"]))
     if not replay_dates:
@@ -2206,9 +2212,9 @@ def run_daily_pipeline():
     target_date = get_target_date()
     print(f"[RUN] A股策略任务启动 target_date={target_date}", flush=True)
     with tempfile.TemporaryDirectory() as tmp:
-        db_path  = os.path.join(tmp, "CN_stock.duckdb")   # 原始 duckdb（仅本地临时）
-        gz_path  = os.path.join(tmp, _DB_GZ_NAME)             # 压缩版（下载/上传用）
-        # ── 1. 从本地固定路径或 OneDrive 拉取压缩数据库并解压 ──
+        db_path  = os.path.join(tmp, "CN_stock.duckdb")
+        gz_path  = os.path.join(tmp, _DB_GZ_NAME)
+        
         db_source, db_gz_ready = obtain_db_gz(LOCAL_DB_GZ_PATH, odc, gz_path)
         if db_gz_ready:
             load_db_gz_to_local(gz_path, db_path)
@@ -2216,6 +2222,7 @@ def run_daily_pipeline():
         else:
             log.info("ℹ️ 本地/OneDrive 均无历史数据库，执行全量初始化")
             initialize_empty_database(db_path)
+            
         with duckdb.connect(db_path) as con:
             _migrate_db_schema(con)
             ensure_core_tables(con)
@@ -2223,7 +2230,6 @@ def run_daily_pipeline():
             latest_before = _latest_trade_date_in_db(con, target_date)
             log.info(f"ℹ️ 更新前数据库最新交易日: {latest_before}")
 
-        # ── 数据源优先级：Qlib tar.gz（最优先）→ DoltHub 流式CSV（降级）──
         _trade_days = int(CONFIG["update_window_trade_days"])
         log.info("📦 [优先] 尝试从 Qlib tar.gz 拉取行情数据 …")
         try:
@@ -2231,6 +2237,7 @@ def run_daily_pipeline():
         except Exception as _qlib_exc:
             log.warning(f"⚠️ Qlib 拉取异常: {_qlib_exc}")
             synced = False
+            
         if not synced:
             log.warning("⚠️ Qlib 未获取到数据，降级到 DoltHub 流式CSV（全量，边下载边写库）…")
             try:
@@ -2238,6 +2245,7 @@ def run_daily_pipeline():
             except Exception as _dolt_exc:
                 log.error(f"❌ DoltHub 流式CSV 也失败: {_dolt_exc}")
                 synced = False
+                
         if not synced:
             log.warning("⚠️ 所有数据源均未获取到行情，继续使用已有数据库数据")
 
@@ -2246,18 +2254,19 @@ def run_daily_pipeline():
             log.warning("⚠️ 无可用交易日数据，结束当日流程")
             print("[RUN] 无可用交易日数据，本次结束", flush=True)
             return
+            
         df_picks, df_portfolio, df_pending, df_trades, metrics = result
         target_str = latest_trade_date.strftime("%Y-%m-%d")
         print(
             f"RESULT {target_str} | 候选:{len(df_picks)} 持仓:{len(df_portfolio)} "
             f"挂单:{len(df_pending)} 成交:{len(df_trades)} 总资产:{metrics.get('total_assets', 0):.2f}"
         )
-        # ── 4. 发送报告 ──
+        
         try:
             generate_and_send_report(tm, df_picks, df_portfolio, df_pending, df_trades, target_str, metrics)
         except Exception as e:
             log.error(f"发送日报失败: {e}")
-        # ── 5. 清理派生表后压缩上传（仅保留 stock_prices 以减少存储）──
+            
         with duckdb.connect(db_path) as con:
             drop_cache_tables(con)
             compact_database(con)
@@ -2273,12 +2282,15 @@ def run_daily_pipeline():
         final_db_size_text = _format_size_mb(_file_size_mb(db_path))
         log.info(f"🧮 最终数据库大小: {final_db_size_text}")
         print(f"[RUN] 最终数据库大小={final_db_size_text}", flush=True)
+        
         if db_source == "local" and LOCAL_DB_GZ_PATH:
             db_compress_to_local(db_path, LOCAL_DB_GZ_PATH)
         else:
             db_compress_and_upload(odc, db_path, gz_path)
+            
         log.info("🎉 今日流程完成")
         print(f"[RUN] 执行完成 latest_trade_date={target_str}", flush=True)
+
 # =========================================================
 # CLI
 # =========================================================
