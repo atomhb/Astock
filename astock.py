@@ -94,7 +94,7 @@ CONFIG = {
     "top_n": 20,
     "adjust_cache_days": 320,
     "source_cache_ttl_seconds": 6 * 3600,
-    "update_window_trade_days": 120,
+    "update_window_trade_days": 150,
     "initial_replay_trade_days": 90,       # 初始回测天数
     "buy_fee_rate": 0.0005,
     "sell_fee_rate": 0.0010,
@@ -133,6 +133,7 @@ def _file_size_mb(path: Optional[str]) -> float:
 
 
 STOCKS_TABLE = "stock_prices"
+ADJUSTMENT_FACTORS_TABLE = "adjustment_factors"
 STOCK_DATE_COL = "tradedate"
 STOCK_SYMBOL_COL = "symbol"
 QLIB_DATA_URL = "https://github.com/chenditc/investment_data/releases/latest/download/qlib_bin.tar.gz"
@@ -483,6 +484,21 @@ def ensure_core_tables(con):
             PRIMARY KEY (symbol, tradedate)
         )
     """)
+    con.execute(f"""
+        CREATE TABLE IF NOT EXISTS {ADJUSTMENT_FACTORS_TABLE} (
+            tradedate DATE,
+            symbol VARCHAR,
+            hfq_factor DOUBLE,
+            PRIMARY KEY (symbol, tradedate)
+        )
+    """)
+    # Backfill factors for databases created before adjustment_factors existed.
+    con.execute(f"""
+        INSERT OR IGNORE INTO {ADJUSTMENT_FACTORS_TABLE} (tradedate, symbol, hfq_factor)
+        SELECT tradedate, symbol, adjclose / NULLIF(close, 0)
+        FROM {STOCKS_TABLE}
+        WHERE close > 0 AND adjclose > 0
+    """)
 
 def ensure_strategy_tables(con):
     con.execute("""
@@ -829,6 +845,20 @@ def get_last_trade_dates_from_qlib(target_date: date, n: int) -> List[date]:
     return dates[-n:]
 
 
+def get_first_trade_date_from_qlib(target_date: date) -> Optional[date]:
+    """Return the earliest available Qlib calendar date up to target_date."""
+    from qlib.data import D
+
+    calendar = D.calendar(
+        start_time="1990-01-01",
+        end_time=target_date.strftime("%Y-%m-%d"),
+        freq="day",
+    )
+    if calendar is None or len(calendar) == 0:
+        return None
+    return pd.to_datetime(calendar).date.min()
+
+
 def _compare_and_sync_stock_rows(con, df_rows: pd.DataFrame) -> Tuple[int, int, int]:
     if df_rows is None or df_rows.empty:
         return 0, 0, 0
@@ -855,6 +885,12 @@ def _compare_and_sync_stock_rows(con, df_rows: pd.DataFrame) -> Tuple[int, int, 
         INSERT OR REPLACE INTO {STOCKS_TABLE} (tradedate, symbol, high, low, open, close, adjclose, volume, amount)
         SELECT tradedate, symbol, high, low, open, close, adjclose, volume, amount
         FROM tmp_new_stocks
+    """)
+    con.execute(f"""
+        INSERT OR REPLACE INTO {ADJUSTMENT_FACTORS_TABLE} (tradedate, symbol, hfq_factor)
+        SELECT tradedate, symbol, adjclose / NULLIF(close, 0)
+        FROM tmp_new_stocks
+        WHERE close > 0 AND adjclose > 0
     """)
     con.execute("CHECKPOINT")
     # 数据体检日志：直接暴露 volume/adjclose 是否全空（候选恒0的最常见根因）
@@ -900,6 +936,50 @@ def investment_data_sync_recent_window(db_path: str, target_date: date, trade_da
         inserted, updated, skipped = _compare_and_sync_stock_rows(con, window_df)
     log.info(f"✅ {STOCKS_TABLE} 5交易日比对完成: 插入={inserted}, 更新={updated}, 跳过={skipped}")
     return (inserted + updated) > 0 or skipped > 0, trade_dates
+
+
+def investment_data_sync_full_history(db_path: str, target_date: date) -> Tuple[bool, List[date]]:
+    """Populate the database from the first Qlib trading day through target_date.
+
+    Annual chunks keep the initial download bounded instead of materializing the
+    entire market history in one DataFrame.
+    """
+    provider_uri = prepare_latest_qlib_data()
+    ensure_qlib_initialized(provider_uri)
+    first_date = get_first_trade_date_from_qlib(target_date)
+    if first_date is None:
+        log.warning("⚠️ Qlib 未返回可用历史交易日，跳过全历史初始化")
+        return False, []
+
+    all_dates: List[date] = []
+    inserted = updated = skipped = 0
+    chunk_start = first_date
+    while chunk_start <= target_date:
+        chunk_end = min(target_date, date(chunk_start.year + 1, 1, 1) - timedelta(days=1))
+        log.info(f"📦 [全历史] 拉取 {chunk_start} ~ {chunk_end}")
+        chunk_df = fetch_qlib_features(chunk_start, chunk_end)
+        if not chunk_df.empty:
+            chunk_df = chunk_df[
+                (chunk_df["tradedate"] >= chunk_start)
+                & (chunk_df["tradedate"] <= chunk_end)
+            ].copy()
+            if not chunk_df.empty:
+                dates = sorted(pd.to_datetime(chunk_df["tradedate"]).dt.date.unique().tolist())
+                all_dates.extend(dates)
+                with duckdb.connect(db_path) as con:
+                    ensure_core_tables(con)
+                    ins, upd, skip = _compare_and_sync_stock_rows(con, chunk_df)
+                inserted += ins
+                updated += upd
+                skipped += skip
+        chunk_start = date(chunk_end.year + 1, 1, 1)
+
+    all_dates = sorted(set(all_dates))
+    log.info(
+        f"✅ [全历史] stock_prices 完成: 插入={inserted}, 更新={updated}, "
+        f"跳过={skipped}, 交易日={len(all_dates)}, 起始={first_date}, 结束={target_date}"
+    )
+    return inserted + updated > 0 or skipped > 0, all_dates
 
 # =========================================================
 # DoltHub CSV 数据源（降级方案）
@@ -1020,13 +1100,12 @@ def get_recent_trade_dates(con, end_date: date, n: int) -> List[date]:
 def rebuild_recent_adjusted_cache(db_path: str, end_date: date, window_days: int) -> bool:
     with duckdb.connect(db_path) as con:
         ensure_core_tables(con)
-        recent_dates = get_recent_trade_dates(con, end_date, window_days)
+        recent_dates = get_recent_trade_dates(con, end_date, int(window_days))
         if not recent_dates:
             return False
         start_date = recent_dates[0]
 
-        # 每次全量重建 daily_hfq_cache，保证与 stock_prices 完全一致
-        # （旧版仅在表不存在时创建，日常模式下新增行情不会进入 hfq 缓存）
+        # adjustment_factors 保留全历史；日常计算缓存只保留最近窗口。
         con.execute('DROP TABLE IF EXISTS daily_hfq_cache')
         con.execute(f"""
             CREATE TABLE daily_hfq_cache AS
@@ -1039,6 +1118,7 @@ def rebuild_recent_adjusted_cache(db_path: str, end_date: date, window_days: int
                 ROUND(close * COALESCE(adjclose / NULLIF(close, 0), 1.0), 2) AS close,
                 volume, amount
             FROM {STOCKS_TABLE}
+            WHERE tradedate BETWEEN '{start_date}' AND '{end_date}'
         """)
         try:
             con.execute("CREATE INDEX idx_hfq_sym_date ON daily_hfq_cache(symbol, date)")
@@ -1225,7 +1305,7 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
     max_position = int(CONFIG.get("max_position_stocks", 5))
     buy_fee_rate = float(CONFIG.get("buy_fee_rate", 0.0005))
 
-    # 大盘允许分配的最大股票市值上限
+    # 大盘允许分配的最大股票市值上限。该上限是新增仓位和已有仓位的合计。
     max_allowed_stock_equity = total_assets * market_pos_ratio
     # 当前已持有的市值
     current_market_val = con.execute("""
@@ -1235,7 +1315,8 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
     """, [trade_date]).fetchone()[0]
 
     # 如果当前持仓已达大盘多级仓位上限，停止买入新股票
-    if current_market_val >= max_allowed_stock_equity:
+    remaining_market_capacity = max_allowed_stock_equity - current_market_val
+    if remaining_market_capacity <= 0:
         log.info(f"🛡️ 当前持仓市值 (¥{current_market_val:,.0f}) 已达大盘环境受控上限 ({market_pos_ratio*100:.0f}%)，暂停新建仓")
         return [], []
 
@@ -1332,7 +1413,7 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
         # ── 风险平价 (Risk Parity) 计算个股目标资金 ──
         # 标杆波动率 3.0%，高波股票少分资金，低波股票多分资金，权重范围限制在 [0.5, 2.0]
         risk_weight = np.clip(0.03 / atr_pct, 0.5, 2.0)
-        target_stock_cash = base_stock_budget * risk_weight
+        target_stock_cash = min(base_stock_budget * risk_weight, remaining_market_capacity)
 
         if current_holdings >= max_position:
             stats["skip_capacity"] += 1
@@ -1356,6 +1437,13 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
         if actual_buy_price_qfq is None:
             # 今日未触价：挂单保留，等待下一个交易日（不立即作废）
             stats["skip_no_touch"] += 1
+            continue
+
+        # 价格和数量确定后再次检查剩余仓位容量，避免单笔最低一手或
+        # 风险平价放大权重导致本次成交突破大盘仓位上限。
+        if actual_buy_price_qfq * 100.0 * (1.0 + buy_fee_rate) > target_stock_cash:
+            stats["skip_capacity"] += 1
+            log.info(f"⏭️ 跳过 {symbol}: 剩余大盘仓位容量不足一手")
             continue
 
         factor = (today_close_hfq / today_close_qfq) if today_close_qfq > 0 else 1.0
@@ -1383,6 +1471,8 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
 
         avail_cash -= actual_cost
         current_holdings += 1
+        current_market_val += gross_cost
+        remaining_market_capacity = max_allowed_stock_equity - current_market_val
         filled_rows.append((symbol, trade_date, actual_buy_price_qfq, buy_price_hfq, int(shares), float(buy_fee), atr_pct))
         stats["filled"] += 1
         log.info(f"✅ 买入成交 {symbol} @¥{actual_buy_price_qfq:.2f} x{int(shares)}股 (挂单¥{planned_buy_price:.2f}, 信号{signal_date}, 今日最低¥{today_low_qfq:.2f})")
@@ -2357,19 +2447,37 @@ def run_daily_pipeline():
             ensure_core_tables(con)
             ensure_strategy_tables(con)
             latest_before = _latest_trade_date_in_db(con, target_date)
+            earliest_before = con.execute(
+                f"SELECT MIN(tradedate) FROM {STOCKS_TABLE}"
+            ).fetchone()[0]
             log.info(f"ℹ️ 更新前数据库最新交易日: {latest_before}")
+            log.info(f"ℹ️ 更新前数据库最早交易日: {earliest_before}")
 
         _trade_days = int(CONFIG["update_window_trade_days"])
         log.info("📦 [优先] 尝试从 Qlib tar.gz 拉取行情数据 …")
         try:
-            synced, _ = investment_data_sync_recent_window(db_path, target_date, _trade_days)
+            needs_full_history = (
+                latest_before is None
+                or earliest_before is None
+                or earliest_before > date(1990, 1, 1)
+            )
+            if needs_full_history:
+                log.info("📚 数据库尚未覆盖完整历史，执行从上市以来的全历史初始化")
+                synced, _ = investment_data_sync_full_history(db_path, target_date)
+            else:
+                log.info(f"🔄 已有历史数据库，仅增量更新最近 {_trade_days} 个交易日")
+                synced, _ = investment_data_sync_recent_window(db_path, target_date, _trade_days)
         except Exception as _qlib_exc:
             log.warning(f"⚠️ Qlib 拉取异常: {_qlib_exc}")
             synced = False
         if not synced:
             log.info("📦 [降级] 尝试从 DoltHub CSV 拉取行情数据 …")
             try:
-                synced, _ = dolthub_sync_recent_window(db_path, target_date, _trade_days)
+                if needs_full_history:
+                    log.info("📚 Qlib 全历史失败，使用 DoltHub 全量CSV初始化")
+                    synced, _ = dolthub_stream_to_db(db_path)
+                else:
+                    synced, _ = dolthub_sync_recent_window(db_path, target_date, _trade_days)
             except Exception as _dolt_exc:
                 log.warning(f"⚠️ DoltHub 拉取异常: {_dolt_exc}")
                 synced = False
@@ -2394,14 +2502,15 @@ def run_daily_pipeline():
         except Exception as _mail_exc:
             log.error(f"❌ 报告邮件发送失败: {_mail_exc}")
 
+        # 先整理数据库，再压缩上传；否则上传的是 VACUUM 之前的版本。
+        with duckdb.connect(db_path) as con:
+            compact_database(con)
+
         # 压缩并上传数据库
         try:
             db_compress_and_upload(odc, db_path, gz_path)
         except Exception as _up_exc:
             log.error(f"❌ 数据库上传失败: {_up_exc}")
-
-        with duckdb.connect(db_path) as con:
-            compact_database(con)
 
         final_size = _file_size_mb(db_path)
         print(f"[RUN] 最终数据库大小={final_size:.1f} MB", flush=True)
