@@ -809,7 +809,7 @@ def fetch_qlib_features(start_date: date, end_date: date) -> pd.DataFrame:
         out[col] = out[col].round(2)
     out["volume"] = out["volume"].round(0)
 
-    out = out.dropna(subset=["tradedate", "symbol", "open", "high", "low", "close", "adjclose", "volume", "amount"])
+    out = out.dropna(subset=["tradedate", "symbol", "open", "high", "low", "close", "adjclose"])
     out = out[["tradedate", "symbol", "high", "low", "open", "close", "adjclose", "volume", "amount"]]
     return out
 
@@ -841,10 +841,7 @@ def _compare_and_sync_stock_rows(con, df_rows: pd.DataFrame) -> Tuple[int, int, 
     for col in ["high", "low", "open", "close", "adjclose", "amount"]:
         tmp[col] = tmp[col].round(2)
     tmp["volume"] = tmp["volume"].round(0)
-    tmp = tmp.dropna(subset=["tradedate", "symbol", "high", "low", "open", "close", "adjclose", "volume", "amount"])
-    # 防御：volume/amount 为 0 或负属于异常数据，一并剔除，避免 NULL/0 参与
-    # SQL 比较（volume > vol_ma5_1 遇 NULL 会整体滤除 → 候选恒为 0）
-    tmp = tmp[(tmp["volume"] > 0) & (tmp["amount"] > 0)] if not tmp.empty else tmp
+    tmp = tmp.dropna(subset=["tradedate", "symbol", "high", "low", "open", "close", "adjclose"])
     if tmp.empty:
         return 0, 0, 0
 
@@ -860,6 +857,23 @@ def _compare_and_sync_stock_rows(con, df_rows: pd.DataFrame) -> Tuple[int, int, 
         FROM tmp_new_stocks
     """)
     con.execute("CHECKPOINT")
+    # 数据体检日志：直接暴露 volume/adjclose 是否全空（候选恒0的最常见根因）
+    try:
+        _shape = con.execute(f"""
+            SELECT COUNT(*) AS n,
+                   COUNT(DISTINCT symbol) AS nsym,
+                   SUM(CASE WHEN volume IS NOT NULL AND volume > 0 THEN 1 ELSE 0 END) AS vol_ok,
+                   SUM(CASE WHEN adjclose IS NOT NULL AND adjclose > 0 THEN 1 ELSE 0 END) AS adj_ok,
+                   AVG(close) AS avg_close, AVG(volume) AS avg_vol
+            FROM {STOCKS_TABLE}
+        """).fetchone()
+        _ac = float(_shape[4]) if _shape[4] else 0.0
+        _av = float(_shape[5]) if _shape[5] else 0.0
+        log.info(f"🩺 stock_prices 体检: 行={_shape[0]} 股票={_shape[1]} "
+                 f"volume非空={_shape[2]} adjclose非空={_shape[3]} "
+                 f"均价={_ac:.2f} 均量={_av:.0f}")
+    except Exception:
+        pass
     return len(tmp), 0, 0
 
 
@@ -2250,6 +2264,43 @@ def _latest_trade_date_in_db(con, target_date: date) -> Optional[date]:
     return pd.to_datetime(row[0]).date()
 
 
+# 版本标记：CI 日志出现此行即证明跑的是修复版
+ASTOCK_VERSION = "fixed-v3-20260811"
+
+
+def self_check(db_path: str, target_date: date) -> None:
+    """同步后自检：打印数据形状 + 在最新交易日跑一次候选计算，
+    让 CI 日志直接暴露「数据是否入库 / 候选为何为0」，无需额外排查。"""
+    try:
+        with duckdb.connect(db_path) as con:
+            ensure_core_tables(con)
+            latest = _latest_trade_date_in_db(con, target_date)
+            shape = con.execute(f"""
+                SELECT COUNT(*), COUNT(DISTINCT symbol),
+                       SUM(CASE WHEN volume IS NOT NULL AND volume > 0 THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN adjclose IS NOT NULL AND adjclose > 0 THEN 1 ELSE 0 END),
+                       AVG(close), AVG(volume)
+                FROM {STOCKS_TABLE}
+            """).fetchone()
+            log.info(
+                f"🩺 自检: 最新交易日={latest} 行={shape[0]} 股票={shape[1]} "
+                f"volume非空={shape[2]} adjclose非空={shape[3]} "
+                f"均价={(float(shape[4]) if shape[4] else 0):.2f} 均量={(float(shape[5]) if shape[5] else 0):.0f}"
+            )
+            if latest is None:
+                log.error("❌ 自检: stock_prices 无数据，候选必为0")
+                return
+            rebuild_recent_adjusted_cache(db_path, latest, CONFIG["adjust_cache_days"])
+            picks = compute_all_signals(con, latest)
+            log.info(f"🩺 自检: 最新交易日 {latest} 候选数={len(picks)}")
+            if not picks.empty:
+                log.info(f"🩺 自检样本: {picks.head(3)[['symbol','close','planned_buy_price']].to_dict('records')}")
+            else:
+                log.warning("❗ 自检: 候选为0 —— 若 vol_null>0 说明数据源 volume 缺失；若 total=0 说明视图/数据日期错位")
+    except Exception as exc:
+        log.error(f"❌ 自检异常: {exc}")
+
+
 def run_strategy_with_replay_if_needed(db_path: str, target_date: date):
     with duckdb.connect(db_path) as con:
         drop_cache_tables(con)
@@ -2287,7 +2338,8 @@ def run_daily_pipeline():
     tm  = TokenManager(CONFIG["azure_client_id"], CONFIG["token_cache_file"])
     odc = OneDriveClient(tm, CONFIG["onedrive_folder"], _DB_GZ_NAME)
     target_date = get_target_date()
-    print(f"[RUN] A股策略任务启动 target_date={target_date}", flush=True)
+    print(f"[RUN] A股策略任务启动 target_date={target_date} version={ASTOCK_VERSION}", flush=True)
+    log.info(f"🚀 astock {ASTOCK_VERSION} 启动 (此行出现即证明 CI 跑的是修复版)")
     with tempfile.TemporaryDirectory() as tmp:
         db_path  = os.path.join(tmp, "CN_stock.duckdb")
         gz_path  = os.path.join(tmp, _DB_GZ_NAME)
@@ -2324,6 +2376,9 @@ def run_daily_pipeline():
         if not synced:
             log.error("❌ 行情数据同步失败，终止流程")
             return None, None
+
+        # 同步后自检：数据形状 + 候选计算（CI 日志可直接定位「全零」根因）
+        self_check(db_path, target_date)
 
         latest_day, result = run_strategy_with_replay_if_needed(db_path, target_date)
         if latest_day is None:
