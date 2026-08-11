@@ -104,10 +104,13 @@ CONFIG = {
     "atr_buy_alpha": 0.5,                  # 挂单价系数：挂单价 = T日收盘价 - 0.5 * ATR(14)
     "atr_stop_loss_beta": 2.0,             # 动态止损系数：止损触发点 = -2.0 * ATR_pct
 
-    "buy_confirm_day_drop_limit": -0.03,   # T+1日内跌幅上限
-    "buy_confirm_vol_ratio_min": 0.5,      # T+1相对量比下限
-    "buy_confirm_ma20_margin": 0.99,       # 允许跌破MA20的容差
-    "buy_signal_expire_days": 2,           # 挂单最长有效天数
+    "buy_confirm_day_drop_limit": -0.03,   # (保留参数) T+1日内跌幅上限
+    "buy_confirm_vol_ratio_min": 0.5,      # (保留参数) T+1相对量比下限
+    "buy_confirm_ma20_margin": 0.99,       # (保留参数) 允许跌破MA20的容差
+    "buy_signal_expire_days": 2,           # 挂单最长有效天数（按交易日计）
+    "buy_confirm_checks": False,           # 是否在挂单成交时附加质量确认(量比/MA20/MACD)。
+                                           # 默认 False：最低价触达挂单价即成交；
+                                           # 若 True，触价后还需通过确认，否则大概率“触价不成交”
     "market_health_check": True,           # 是否启用大盘过滤
     "filter_gem_star": False,               # 是否过滤创业板/科创板
     "init_cash": 100000.0,                 # 初始资金参数
@@ -1170,6 +1173,15 @@ def get_market_target_position_ratio(con, trade_date: date, index_symbol="000001
         return 0.3
 
 
+def _trading_day_gap(con, d1: date, d2: date) -> int:
+    """统计 d1(不含) 到 d2(含) 之间的交易日数量（以 stock_prices 实际日历为准）。"""
+    n = con.execute(
+        f"SELECT COUNT(DISTINCT tradedate) FROM {STOCKS_TABLE} WHERE tradedate > ? AND tradedate <= ?",
+        [d1, d2],
+    ).fetchone()[0]
+    return int(n)
+
+
 def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tuple]]:
     # 依据大盘多级环境获取目标持仓上限比例
     market_pos_ratio = get_market_target_position_ratio(con, trade_date)
@@ -1178,6 +1190,7 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
         SELECT symbol, signal_date, planned_buy_price, signal_close, trade_type, status, signal_strength, atr_pct
         FROM pending_orders
         WHERE status=0 AND signal_date < ?
+        ORDER BY signal_date, symbol
     """, [trade_date]).df()
     if pending_df.empty:
         return [], []
@@ -1228,27 +1241,42 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
     q_map = {row['symbol']: row for _, row in qfq_today.iterrows()}
     h_map = {row['symbol']: row for _, row in hfq_today.iterrows()}
 
-    day_drop_limit = float(CONFIG.get("buy_confirm_day_drop_limit", -0.03))
     vol_ratio_min = float(CONFIG.get("buy_confirm_vol_ratio_min", 0.5))
     ma20_margin = float(CONFIG.get("buy_confirm_ma20_margin", 0.99))
     expire_days = int(CONFIG.get("buy_signal_expire_days", 2))
+    # 是否在成交时附加质量确认（默认关闭）。
+    # 说明：挂单价本身已含 ATR 折价过滤；若开启质量确认，T+1 的
+    # 放量/MA20 等条件会在价格触价时大概率拒单，导致“触价却不成交”。
+    confirm_checks = bool(CONFIG.get("buy_confirm_checks", False))
 
     current_holdings = con.execute("SELECT COUNT(*) FROM virtual_portfolio").fetchone()[0]
+    holding_symbols = {r[0] for r in con.execute("SELECT symbol FROM virtual_portfolio").fetchall()}
 
     filled_rows, expired_rows = [], []
+    stats = {"filled": 0, "expired_timeout": 0, "skip_no_data": 0, "skip_no_touch": 0,
+             "skip_capacity": 0, "skip_cash": 0, "skip_confirm": 0, "skip_dup": 0}
     for _, row in pending_df.iterrows():
         symbol = row['symbol']
         signal_date = row['signal_date']
         planned_buy_price = float(row['planned_buy_price'])
         atr_pct = float(row['atr_pct']) if 'atr_pct' in row and not pd.isna(row['atr_pct']) and float(row['atr_pct']) > 0 else 0.03
 
-        days_elapsed = (trade_date - pd.to_datetime(signal_date).date()).days
-        if days_elapsed > expire_days:
+        # ── 挂单有效期：以交易日计算，窗口内持续有效 ──
+        trade_gap = _trading_day_gap(con, pd.to_datetime(signal_date).date(), trade_date)
+        if trade_gap > expire_days:
             expired_rows.append((symbol, signal_date))
+            stats["expired_timeout"] += 1
+            log.info(f"⏳ 挂单过期 {symbol} (信号{signal_date}, 已{trade_gap}个交易日>{expire_days})")
+            continue
+
+        if symbol in holding_symbols or symbol in {f[0] for f in filled_rows}:
+            stats["skip_dup"] += 1
+            log.info(f"⏭️ 跳过 {symbol}: 已持仓/当日已成交，避免重复买入")
             continue
 
         if symbol not in q_map:
-            expired_rows.append((symbol, signal_date))
+            # 当日停牌/无数据：不立即作废，留待后续交易日（在有效期内）
+            stats["skip_no_data"] += 1
             continue
 
         row_t1 = q_map[symbol]
@@ -1259,84 +1287,91 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
         today_close_hfq = float(h_map[symbol]['close']) if symbol in h_map else today_close_qfq
         signal_close = float(row['signal_close']) if not pd.isna(row['signal_close']) else planned_buy_price
 
-        day_ret = (today_close_qfq - today_open_qfq) / today_open_qfq if today_open_qfq > 0 else 0
-        if day_ret < day_drop_limit:
-            expired_rows.append((symbol, signal_date))
-            continue
+        # ── 触价判定：T+1 最低价 ≤ 挂单价 即成交（核心规则）──
+        touched = (today_low_qfq <= planned_buy_price)
 
-        sym_hist = hist_df[hist_df['symbol'] == symbol].copy()
-        if len(sym_hist) < 20:
-            expired_rows.append((symbol, signal_date))
-            continue
-
-        ma20_t1 = float(sym_hist['close'].tail(20).mean())
-        vol_ma5_prev = float(sym_hist['volume'].iloc[:-1].tail(5).mean()) if len(sym_hist) > 5 else 0.0
-
-        if vol_ma5_prev > 0:
-            vol_ratio = today_vol_qfq / vol_ma5_prev
-            if vol_ratio < vol_ratio_min:
-                expired_rows.append((symbol, signal_date))
+        # ── 可选质量确认（默认关闭，避免“触价却不成交”）──
+        if confirm_checks and touched:
+            sym_hist = hist_df[hist_df['symbol'] == symbol].copy()
+            if len(sym_hist) < 20:
+                stats["skip_confirm"] += 1
                 continue
-
-        if today_close_qfq < ma20_t1 * ma20_margin:
-            expired_rows.append((symbol, signal_date))
-            continue
-
-        if talib is not None and len(sym_hist) >= 40:
-            c_vals = sym_hist['close'].values.astype(np.float64)
-            macd, macdsignal, macdhist = talib.MACD(c_vals, fastperiod=12, slowperiod=26, signalperiod=9)
-            if not pd.isna(macdhist[-1]) and not pd.isna(macdhist[-2]) and not pd.isna(macdhist[-3]):
-                if macdhist[-1] <= 0 or (macdhist[-1] < macdhist[-2] and macdhist[-2] < macdhist[-3]):
-                    expired_rows.append((symbol, signal_date))
-                    continue
+            ma20_t1 = float(sym_hist['close'].tail(20).mean())
+            vol_ma5_prev = float(sym_hist['volume'].iloc[:-1].tail(5).mean()) if len(sym_hist) > 5 else 0.0
+            if vol_ma5_prev > 0 and (today_vol_qfq / vol_ma5_prev) < vol_ratio_min:
+                stats["skip_confirm"] += 1
+                log.info(f"⏭️ 确认未过 {symbol}: 量比{(today_vol_qfq / vol_ma5_prev):.2f}<{vol_ratio_min}")
+                continue
+            if today_close_qfq < ma20_t1 * ma20_margin:
+                stats["skip_confirm"] += 1
+                log.info(f"⏭️ 确认未过 {symbol}: 收盘{today_close_qfq:.2f}<MA20*{ma20_margin:.2f}")
+                continue
+            if talib is not None and len(sym_hist) >= 40:
+                c_vals = sym_hist['close'].values.astype(np.float64)
+                macd, macdsignal, macdhist = talib.MACD(c_vals, fastperiod=12, slowperiod=26, signalperiod=9)
+                if not pd.isna(macdhist[-1]) and not pd.isna(macdhist[-2]) and not pd.isna(macdhist[-3]):
+                    if macdhist[-1] <= 0 or (macdhist[-1] < macdhist[-2] and macdhist[-2] < macdhist[-3]):
+                        stats["skip_confirm"] += 1
+                        log.info(f"⏭️ 确认未过 {symbol}: MACD柱≤0或走弱")
+                        continue
 
         # ── 风险平价 (Risk Parity) 计算个股目标资金 ──
         # 标杆波动率 3.0%，高波股票少分资金，低波股票多分资金，权重范围限制在 [0.5, 2.0]
         risk_weight = np.clip(0.03 / atr_pct, 0.5, 2.0)
         target_stock_cash = base_stock_budget * risk_weight
 
-        if avail_cash >= target_stock_cash * 0.5 and current_holdings < max_position:
-            cost_yuan_budget = min(target_stock_cash, avail_cash)
-        else:
-            expired_rows.append((symbol, signal_date))
+        if current_holdings >= max_position:
+            stats["skip_capacity"] += 1
+            log.info(f"⏭️ 跳过 {symbol}: 持仓数已达上限 {max_position}")
             continue
+        if avail_cash < target_stock_cash * 0.5:
+            stats["skip_cash"] += 1
+            log.info(f"⏭️ 跳过 {symbol}: 可用资金不足 (¥{avail_cash:,.0f}<¥{target_stock_cash*0.5:,.0f})")
+            continue
+        cost_yuan_budget = min(target_stock_cash, avail_cash)
 
         signal_strength = float(row['signal_strength']) if 'signal_strength' in row and not pd.isna(row['signal_strength']) else 0.0
         HIGH_CONFIDENCE = 2.0
 
         actual_buy_price_qfq = None
-        if today_low_qfq <= planned_buy_price:
+        if touched:
             actual_buy_price_qfq = planned_buy_price
         elif signal_strength >= HIGH_CONFIDENCE and today_open_qfq <= signal_close * 1.02:
             actual_buy_price_qfq = today_open_qfq
 
-        if actual_buy_price_qfq is not None:
-            factor = (today_close_hfq / today_close_qfq) if today_close_qfq > 0 else 1.0
-            buy_price_hfq = round(actual_buy_price_qfq * factor, 2)
+        if actual_buy_price_qfq is None:
+            # 今日未触价：挂单保留，等待下一个交易日（不立即作废）
+            stats["skip_no_touch"] += 1
+            continue
 
-            lot_cost = actual_buy_price_qfq * 100.0 * (1.0 + buy_fee_rate)
-            shares = int(cost_yuan_budget / lot_cost) * 100
+        factor = (today_close_hfq / today_close_qfq) if today_close_qfq > 0 else 1.0
+        buy_price_hfq = round(actual_buy_price_qfq * factor, 2)
+
+        lot_cost = actual_buy_price_qfq * 100.0 * (1.0 + buy_fee_rate)
+        shares = int(cost_yuan_budget / lot_cost) * 100
+        if shares < 100:
+            expired_rows.append((symbol, signal_date))
+            stats["skip_cash"] += 1
+            continue
+
+        gross_cost = round(shares * actual_buy_price_qfq, 2)
+        buy_fee = round(gross_cost * buy_fee_rate, 2)
+        actual_cost = round(gross_cost + buy_fee, 2)
+        if actual_cost > avail_cash:
+            shares = int(avail_cash / lot_cost) * 100
             if shares < 100:
                 expired_rows.append((symbol, signal_date))
+                stats["skip_cash"] += 1
                 continue
-
             gross_cost = round(shares * actual_buy_price_qfq, 2)
             buy_fee = round(gross_cost * buy_fee_rate, 2)
             actual_cost = round(gross_cost + buy_fee, 2)
-            if actual_cost > avail_cash:
-                shares = int(avail_cash / lot_cost) * 100
-                if shares < 100:
-                    expired_rows.append((symbol, signal_date))
-                    continue
-                gross_cost = round(shares * actual_buy_price_qfq, 2)
-                buy_fee = round(gross_cost * buy_fee_rate, 2)
-                actual_cost = round(gross_cost + buy_fee, 2)
 
-            avail_cash -= actual_cost
-            current_holdings += 1
-            filled_rows.append((symbol, trade_date, actual_buy_price_qfq, buy_price_hfq, int(shares), float(buy_fee), atr_pct))
-        else:
-            expired_rows.append((symbol, signal_date))
+        avail_cash -= actual_cost
+        current_holdings += 1
+        filled_rows.append((symbol, trade_date, actual_buy_price_qfq, buy_price_hfq, int(shares), float(buy_fee), atr_pct))
+        stats["filled"] += 1
+        log.info(f"✅ 买入成交 {symbol} @¥{actual_buy_price_qfq:.2f} x{int(shares)}股 (挂单¥{planned_buy_price:.2f}, 信号{signal_date}, 今日最低¥{today_low_qfq:.2f})")
 
     if filled_rows:
         con.execute("UPDATE account_state SET available_cash=? WHERE id=1", [avail_cash])
@@ -1345,13 +1380,20 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
             VALUES (?, ?, ?, ?, ?, ?)
         """, [(s, d, bp, bph, sh, atr) for s, d, bp, bph, sh, _, atr in filled_rows])
         for symbol, buy_date, buy_price, buy_price_hfq, shares, buy_fee, _ in filled_rows:
-            con.execute(f"UPDATE pending_orders SET status={STATUS_FILLED} WHERE symbol=? AND status={STATUS_PENDING}", [symbol])
+            con.execute(f"UPDATE pending_orders SET status={STATUS_FILLED} WHERE symbol=? AND signal_date<? AND status={STATUS_PENDING}", [symbol, trade_date])
             con.execute("""
                 INSERT INTO trade_history(symbol, trade_type, signal_date, trade_date, price, shares, reason, pnl_pct, fee)
                 VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, ?)
             """, [symbol, TRADE_BUY, buy_date, round(buy_price, 2), shares, REASON_BUY_T1, round(buy_fee, 2)])
     if expired_rows:
         con.executemany(f"UPDATE pending_orders SET status={STATUS_EXPIRED} WHERE symbol=? AND signal_date=? AND status={STATUS_PENDING}", expired_rows)
+    if stats["filled"] or any(v > 0 for v in stats.values()):
+        log.info(
+            f"📋 挂单处理 [{trade_date}] 成交={stats['filled']} 超时作废={stats['expired_timeout']} "
+            f"未触价保留={stats['skip_no_touch']} 停牌跳过={stats['skip_no_data']} "
+            f"仓位满={stats['skip_capacity']} 资金不足={stats['skip_cash']} "
+            f"确认拦截={stats['skip_confirm']} 重复={stats['skip_dup']}"
+        )
     return filled_rows, expired_rows
 
 
@@ -1644,18 +1686,29 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
     with duckdb.connect(db_path, read_only=False) as con:
         ensure_core_tables(con)
         ensure_strategy_tables(con)
-        process_pending_orders(con, target_date)
         history_before = con.execute("SELECT COUNT(*) FROM account_history WHERE date < ?", [target_date]).fetchone()[0]
+        # 先执行卖出规则，释放仓位与资金，供当日触价挂单成交使用
+        # （旧顺序为先买入后卖出，满仓时触价单被仓位上限拦截、即使当日有卖出也用不上空位）
         if allow_exit_on_date and int(history_before) > 0:
             process_exit_rules(con, target_date)
         else:
             log.info(f"🛡️ 初始交易日 {target_date} 仅允许买入，跳过卖出规则")
+        process_pending_orders(con, target_date)
 
         df_picks = compute_all_signals(con, target_date)
         if not df_picks.empty:
             df_picks = df_picks.sort_values(["total_score", "symbol"], ascending=[False, True]).head(top_n).reset_index(drop=True)
 
-        con.execute(f"UPDATE pending_orders SET status={STATUS_EXPIRED} WHERE status={STATUS_PENDING}")
+        # 清理超龄挂单（有效期 buy_signal_expire_days 个交易日），
+        # 有效期内未触价的挂单保留，等待后续交易日（不再每天一刀切全部作废）
+        _exp = int(CONFIG.get("buy_signal_expire_days", 2))
+        con.execute(f"""
+            UPDATE pending_orders SET status={STATUS_EXPIRED}
+            WHERE status={STATUS_PENDING} AND signal_date <= (
+                SELECT tradedate FROM {STOCKS_TABLE}
+                WHERE tradedate < ? ORDER BY tradedate DESC LIMIT 1 OFFSET ?
+            )
+        """, [target_date, _exp])
         holdings_df = con.execute("SELECT symbol FROM virtual_portfolio").df()
         holding_symbols = set(holdings_df["symbol"]) if not holdings_df.empty else set()
         new_orders = []
