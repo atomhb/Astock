@@ -295,35 +295,119 @@ class OneDriveClient:
 # =========================================================
 # 数据库表结构体检与主键自动无损迁移
 # =========================================================
-def _check_and_fix_pk(con, table_name: str, expected_pk: List[str], create_sql: str):
-    """
-    检查表是否存在且是否具备完整的 PRIMARY KEY。
-    如果表存在但缺少主键（常见于历史旧库），自动执行无损去重并重建主键，杜绝 Binder Error。
-    """
-    tables = [t[0] for t in con.execute("SHOW TABLES").fetchall()]
-    if table_name not in tables:
+def _check_and_fix_pk(
+    con,
+    table_name: str,
+    expected_pk: List[str],
+    create_sql: str,
+) -> None:
+    """Ensure a table has the required primary key, migrating data if needed."""
+    existing_tables = {row[0] for row in con.execute("SHOW TABLES").fetchall()}
+    if table_name not in existing_tables:
         con.execute(create_sql)
+        log.info(f"✅ 已创建表 [{table_name}]，主键={expected_pk}")
         return
 
-    cols = con.execute(f"PRAGMA table_info('{table_name}')").fetchall()
-    actual_pk = [c[1] for c in cols if len(c) > 5 and c[5] > 0]
-    if set(actual_pk) != set(expected_pk):
-        log.warning(f"🔄 检测到表 [{table_name}] 缺少主键约束 (当前:{actual_pk}, 期望:{expected_pk})，执行全量无损迁移重建...")
-        tmp_name = f"{table_name}_pk_migration_tmp"
-        con.execute(f"DROP TABLE IF EXISTS {tmp_name}")
-        tmp_create_sql = create_sql.replace(f"CREATE TABLE IF NOT EXISTS {table_name}", f"CREATE TABLE {tmp_name}").replace(f"CREATE TABLE {table_name}", f"CREATE TABLE {tmp_name}")
+    table_info = con.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+    actual_pk = [
+        row[1]
+        for row in sorted(table_info, key=lambda row: int(row[5] or 0))
+        if int(row[5] or 0) > 0
+    ]
+    if actual_pk == expected_pk:
+        return
+
+    log.warning(
+        f"🔄 检测到表 [{table_name}] 主键不符合预期 "
+        f"(当前:{actual_pk}, 期望:{expected_pk})，执行全量无损迁移重建..."
+    )
+
+    tmp_name = f"__{table_name}_pk_migration_tmp"
+    legacy_bad_tmp_name = f"{table_name}_pk_migration_tmp_pk_migration_tmp"
+    prefix_if_not_exists = f"CREATE TABLE IF NOT EXISTS {table_name}"
+    prefix_plain = f"CREATE TABLE {table_name}"
+
+    if prefix_if_not_exists in create_sql:
+        tmp_create_sql = create_sql.replace(
+            prefix_if_not_exists, f'CREATE TABLE "{tmp_name}"', 1
+        )
+    elif prefix_plain in create_sql:
+        tmp_create_sql = create_sql.replace(
+            prefix_plain, f'CREATE TABLE "{tmp_name}"', 1
+        )
+    else:
+        raise ValueError(
+            f"无法从 create_sql 中定位目标表 [{table_name}] 的 CREATE TABLE 语句。"
+        )
+
+    all_columns = [row[1] for row in table_info]
+    if not all_columns:
+        raise RuntimeError(f"表 [{table_name}] 存在，但无法读取字段信息。")
+
+    quoted_columns = ", ".join(f'"{column}"' for column in all_columns)
+    quoted_pk_columns = ", ".join(f'"{column}"' for column in expected_pk)
+    pk_not_null_condition = " AND ".join(
+        f'"{column}" IS NOT NULL' for column in expected_pk
+    )
+
+    con.execute("BEGIN TRANSACTION")
+    try:
+        con.execute(f'DROP TABLE IF EXISTS "{tmp_name}"')
+        con.execute(f'DROP TABLE IF EXISTS "{legacy_bad_tmp_name}"')
         con.execute(tmp_create_sql)
-        pk_expr = ", ".join(expected_pk)
-        where_cond = " AND ".join(f"{c} IS NOT NULL" for c in expected_pk)
         con.execute(f"""
-            INSERT INTO {tmp_name}
-            SELECT DISTINCT ON ({pk_expr}) * FROM {table_name}
-            WHERE {where_cond}
+            INSERT INTO "{tmp_name}" ({quoted_columns})
+            SELECT {quoted_columns}
+            FROM (
+                SELECT
+                    {quoted_columns},
+                    ROW_NUMBER() OVER (
+                        PARTITION BY {quoted_pk_columns}
+                        ORDER BY rowid DESC
+                    ) AS _rn
+                FROM "{table_name}"
+                WHERE {pk_not_null_condition}
+            ) AS dedup
+            WHERE _rn = 1
         """)
-        con.execute(f"DROP TABLE {table_name}")
-        con.execute(f"ALTER TABLE {tmp_name} RENAME TO {table_name}")
+
+        old_count = con.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
+        new_count = con.execute(f'SELECT COUNT(*) FROM "{tmp_name}"').fetchone()[0]
+
+        con.execute(f'DROP TABLE "{table_name}"')
+        con.execute(f'ALTER TABLE "{tmp_name}" RENAME TO "{table_name}"')
+
+        migrated_info = con.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+        migrated_pk = [
+            row[1]
+            for row in sorted(migrated_info, key=lambda row: int(row[5] or 0))
+            if int(row[5] or 0) > 0
+        ]
+        if migrated_pk != expected_pk:
+            raise RuntimeError(
+                f"表 [{table_name}] 主键迁移校验失败：实际={migrated_pk}，期望={expected_pk}"
+            )
+
+        con.execute("COMMIT")
         con.execute("CHECKPOINT")
-        log.info(f"✅ [{table_name}] 成功重建主键: {expected_pk}")
+        removed_count = old_count - new_count
+        if removed_count > 0:
+            log.warning(
+                f"✅ 表 [{table_name}] 主键迁移完成：旧表 {old_count:,} 行，"
+                f"新表 {new_count:,} 行；已去除 {removed_count:,} 条重复键或空主键记录。"
+            )
+        else:
+            log.info(
+                f"✅ 表 [{table_name}] 主键迁移完成：已保留 {new_count:,} 行数据，"
+                f"主键={expected_pk}"
+            )
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except Exception:
+            pass
+        log.exception(f"❌ 表 [{table_name}] 主键迁移失败，已回滚数据库事务。")
+        raise
 
 def ensure_core_tables(con):
     stocks_sql = f"""
