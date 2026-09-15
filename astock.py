@@ -128,7 +128,7 @@ CONFIG = {
     "init_cash": 100000.0,
     "position_cash_yuan": 40000.0,
     "max_position_stocks": 6,
-    "initial_replay_trade_days": 200,      # 数据库为空时回测交易日数
+    "initial_replay_trade_days": 100,      # 数据库为空时回测交易日数
     "update_window_trade_days": 380,       # 行情同步窗口（覆盖200天回测+180天指标预热）
     "adjust_cache_days": 380,
     "top_n": 15,
