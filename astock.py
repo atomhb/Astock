@@ -37,27 +37,17 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib import font_manager
-from dotenv import load_dotenv
 
-
-def configure_matplotlib_chinese_font() -> None:
-    candidates = [
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-        "C:/Windows/Fonts/msyh.ttc",
-        "/System/Library/Fonts/PingFang.ttc",
-    ]
-    for font_path in candidates:
-        if os.path.isfile(font_path):
-            font_manager.fontManager.addfont(font_path)
-            font_name = font_manager.FontProperties(fname=font_path).get_name()
-            matplotlib.rcParams["font.family"] = "sans-serif"
-            matplotlib.rcParams["font.sans-serif"] = [font_name, "DejaVu Sans"]
-            matplotlib.rcParams["axes.unicode_minus"] = False
+def configure_matplotlib_chinese_font():
+    for p in ['/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc','/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc','/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc','C:/Windows/Fonts/msyh.ttc','/System/Library/Fonts/PingFang.ttc']:
+        if os.path.isfile(p):
+            font_manager.fontManager.addfont(p)
+            name=font_manager.FontProperties(fname=p).get_name()
+            matplotlib.rcParams['font.sans-serif']=[name,'DejaVu Sans']
+            matplotlib.rcParams['axes.unicode_minus']=False
             return
-    matplotlib.rcParams["axes.unicode_minus"] = False
+    matplotlib.rcParams['axes.unicode_minus']=False
+from dotenv import load_dotenv
 from tqdm import tqdm
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -117,7 +107,7 @@ CONFIG = {
     "adjust_cache_days": 320,
     "source_cache_ttl_seconds": 6 * 3600,
     "update_window_trade_days": 150,
-    "initial_replay_trade_days": 300,       # 初始回测天数
+    "initial_replay_trade_days": 90,       # 初始回测天数
     "buy_fee_rate": 0.0005,
     "sell_fee_rate": 0.0010,
 
@@ -137,11 +127,19 @@ CONFIG = {
     "filter_gem_star": False,               # 是否过滤创业板/科创板
     "init_cash": 100000.0,                 # 初始资金参数
     "max_position_stocks": 5,             # 持仓中最多有的股票数
-    "full_history_start_date": "1990-01-01", # 新库或历史不完整时，从该日期起按年度补齐
-    "full_history_chunk_years": 1,           # 分块读取，避免一次性占满内存
-    "report_trade_history_limit": 50,        # 邮件报告展示最近50笔成交，非仅当日
-
-    # 下跌趋势风险控制：仅使用原策略已有的沪指 MA5 / MA20 信息
+    "full_history_start_date": "1990-01-01",
+    "full_history_chunk_years": 1,
+    "report_trade_history_limit": 50,
+    "breakeven_trigger_pct": 8.0,
+    "partial_take_profit_1_pct": 12.0,
+    "partial_take_profit_1_ratio": 1.0 / 3.0,
+    "partial_take_profit_2_pct": 15.0,
+    "partial_take_profit_2_ratio": 1.0 / 3.0,
+    "trailing_stop_start_pct": 12.0,
+    "trailing_stop_atr_mult": 2.5,
+    "strong_market_open_min_ratio": 0.98,
+    "strong_market_open_max_ratio": 1.02,
+    "weak_market_open_drop_limit": -0.02,
     "bear_market_pos_ratio": 0.30,
     "deep_bear_market_pos_ratio": 0.10,
     "crash_market_pos_ratio": 0.00,
@@ -190,7 +188,7 @@ REASON_BELOW_BOLL_MID = 8  # bit3: 跌破布林中轨
 REASON_BEAR_PATTERN = 16   # bit4: 出现下跌形态
 REASON_MACD_DECREASE = 32  # bit5: MACD差值减小
 REASON_BUY_T1 = 64         # bit6: T+1买入
-REASON_MARKET_RISK_REBALANCE = 128  # bit7: 下跌趋势强制降仓
+REASON_TRAILING_TAKE_PROFIT = 128
 
 
 def decode_trade_type_label(code) -> str:
@@ -215,8 +213,8 @@ def decode_reason_text(code) -> str:
         parts.append("MACD差值减小")
     if code & REASON_BUY_T1:
         parts.append("T+1动态ATR挂单成交")
-    if code & REASON_MARKET_RISK_REBALANCE:
-        parts.append("大盘下跌强制降仓")
+    if code & REASON_TRAILING_TAKE_PROFIT:
+        parts.append("Trailing ATR移动止盈")
     return " / ".join(parts) if parts else ""
 
 def _resolve_local_db_gz_path() -> Optional[str]:
@@ -571,9 +569,18 @@ def ensure_strategy_tables(con):
             buy_price DOUBLE,
             buy_price_hfq DOUBLE,
             shares BIGINT,
-            atr_pct_buy DOUBLE
+            atr_pct_buy DOUBLE,
+            highest_price_hfq DOUBLE,
+            take_profit_stage TINYINT DEFAULT 0
         )
     """)
+    try:
+        con.execute("ALTER TABLE virtual_portfolio ADD COLUMN IF NOT EXISTS highest_price_hfq DOUBLE")
+        con.execute("ALTER TABLE virtual_portfolio ADD COLUMN IF NOT EXISTS take_profit_stage TINYINT DEFAULT 0")
+        con.execute("UPDATE virtual_portfolio SET highest_price_hfq = buy_price_hfq WHERE highest_price_hfq IS NULL")
+        con.execute("UPDATE virtual_portfolio SET take_profit_stage = 0 WHERE take_profit_stage IS NULL")
+    except Exception:
+        pass
     try:
         con.execute("ALTER TABLE virtual_portfolio ADD COLUMN IF NOT EXISTS atr_pct_buy DOUBLE")
     except Exception:
@@ -1278,85 +1285,20 @@ def detect_kline_patterns(open_s, high_s, low_s, close_s) -> Tuple[str, float, s
 
 # ── 3. 大盘环境多级仓位管理 (Regime Switching) ──
 def get_market_target_position_ratio(con, trade_date: date, index_symbol="000001.SH") -> float:
-    """只使用原策略已有的沪指 MA5/MA20，给出组合股票市值硬上限。"""
-    if not CONFIG.get("market_health_check", True):
-        return 1.0
-    df = con.execute("""
-        SELECT date, close FROM daily_qfq_cache
-        WHERE symbol = ? AND date <= ?
-        ORDER BY date DESC LIMIT 20
-    """, [index_symbol, trade_date]).df()
-    if len(df) < 20:
-        return 1.0
-    ma5 = float(df["close"].iloc[:5].mean())
-    ma20 = float(df["close"].mean())
-    if ma20 <= 0:
-        return 1.0
-    ratio = ma5 / ma20
-    if ratio >= 1.00:
-        return 1.00
-    if ratio >= 0.98:
-        return 0.50
-    if ratio >= float(CONFIG["deep_bear_ma20_ratio"]):
-        return float(CONFIG["bear_market_pos_ratio"])
-    if ratio >= float(CONFIG["crash_ma20_ratio"]):
-        return float(CONFIG["deep_bear_market_pos_ratio"])
-    return float(CONFIG["crash_market_pos_ratio"])
-
-
-def enforce_market_risk_rebalance(con, trade_date: date) -> List[Tuple]:
-    """市场转跌时强制卖出旧持仓，防止原策略只限新仓、不降旧仓。"""
-    ratio = get_market_target_position_ratio(con, trade_date)
-    _, total_assets, available_cash = get_account_state(con)
-    holdings = con.execute("SELECT symbol, buy_price, shares FROM virtual_portfolio").df()
-    if holdings.empty or total_assets <= 0:
-        return []
-    raw = con.execute(f"SELECT symbol, close FROM {STOCKS_TABLE} WHERE tradedate=?", [trade_date]).df()
-    if raw.empty:
-        return []
-    raw["symbol"] = raw["symbol"].map(canonical_symbol)
-    price_map = dict(zip(raw["symbol"], raw["close"]))
-    holdings["price"] = holdings["symbol"].map(price_map)
-    holdings = holdings.dropna(subset=["price"]).copy()
-    if holdings.empty:
-        return []
-    holdings["price"] = holdings["price"].astype(float)
-    holdings["shares"] = holdings["shares"].astype(int)
-    holdings["value"] = holdings["price"] * holdings["shares"]
-    current_value = float(holdings["value"].sum())
-    target_value = float(total_assets) * ratio
-    excess = current_value - target_value
-    if excess <= float(CONFIG["market_rebalance_tolerance_yuan"]):
-        return []
-    holdings["pnl_pct"] = (holdings["price"] - holdings["buy_price"].astype(float)) / holdings["buy_price"].astype(float) * 100.0
-    holdings = holdings.sort_values("pnl_pct", ascending=True)
-    fee_rate = float(CONFIG["sell_fee_rate"])
-    sold = []
-    for _, row in holdings.iterrows():
-        if excess <= 0:
-            break
-        price = float(row["price"])
-        shares = int(row["shares"])
-        value = price * shares
-        sell_shares = shares if value <= excess or excess / max(value, 1.0) >= 0.60 else max(100, int(excess / (price * 100.0)) * 100)
-        sell_shares = min(sell_shares, shares)
-        gross = round(sell_shares * price, 2)
-        fee = round(gross * fee_rate, 2)
-        if sell_shares == shares:
-            con.execute("DELETE FROM virtual_portfolio WHERE symbol=?", [row["symbol"]])
-        else:
-            con.execute("UPDATE virtual_portfolio SET shares=shares-? WHERE symbol=?", [sell_shares, row["symbol"]])
-        con.execute("""
-            INSERT INTO trade_history(symbol, trade_type, signal_date, trade_date, price, shares, reason, pnl_pct, fee)
-            VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
-        """, [row["symbol"], TRADE_SELL, trade_date, price, sell_shares, REASON_MARKET_RISK_REBALANCE, round(float(row["pnl_pct"]), 2), fee])
-        available_cash += gross - fee
-        excess -= gross
-        sold.append((row["symbol"], sell_shares, price))
-    if sold:
-        con.execute("UPDATE account_state SET available_cash=? WHERE id=1", [available_cash])
-        log.warning(f"🚨 大盘风险降仓：目标仓位{ratio*100:.0f}%，卖出{len(sold)}笔持仓")
-    return sold
+    """Two-day MA20 breakdown confirmation with 100/50/30/10/0 risk caps."""
+    if not CONFIG.get("market_health_check", True): return 1.0
+    df=con.execute("""SELECT date,close,AVG(close) OVER(ORDER BY date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) ma20
+    FROM daily_qfq_cache WHERE symbol=? AND date<=? ORDER BY date DESC LIMIT 25""",[index_symbol,trade_date]).df()
+    if len(df)<22:return 1.0
+    df=df.sort_values('date').reset_index(drop=True); ma5=float(df.close.iloc[-5:].mean()); ma20=float(df.ma20.iloc[-1])
+    confirmed=float(df.close.iloc[-1])<ma20 and float(df.close.iloc[-2])<float(df.ma20.iloc[-2])
+    if ma5>=ma20:return 1.0
+    if not confirmed:return .5
+    r=ma5/ma20
+    if r>=.98:return .5
+    if r>=.95:return .3
+    if r>=.90:return .1
+    return 0.0
 
 def _trading_day_gap(con, d1: date, d2: date) -> int:
     """统计 d1(不含) 到 d2(含) 之间的交易日数量（以 stock_prices 实际日历为准）。"""
@@ -1516,14 +1458,16 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
             continue
         cost_yuan_budget = min(target_stock_cash, avail_cash)
 
-        signal_strength = float(row['signal_strength']) if 'signal_strength' in row and not pd.isna(row['signal_strength']) else 0.0
-        HIGH_CONFIDENCE = 2.0
-
+        # 强势大盘采用次日开盘确认买入；非强势市场保留ATR低吸，但开盘跌超2%拒绝接飞刀。
         actual_buy_price_qfq = None
-        if touched:
+        open_return = today_open_qfq / signal_close - 1.0 if signal_close > 0 else 0.0
+        strong_market = market_pos_ratio >= 1.0
+        if strong_market:
+            if (today_open_qfq >= signal_close * float(CONFIG["strong_market_open_min_ratio"])
+                    and today_open_qfq <= signal_close * float(CONFIG["strong_market_open_max_ratio"])):
+                actual_buy_price_qfq = today_open_qfq
+        elif open_return >= float(CONFIG["weak_market_open_drop_limit"]) and touched:
             actual_buy_price_qfq = planned_buy_price
-        elif signal_strength >= HIGH_CONFIDENCE and today_open_qfq <= signal_close * 1.02:
-            actual_buy_price_qfq = today_open_qfq
 
         if actual_buy_price_qfq is None:
             # 今日未触价：挂单保留，等待下一个交易日（不立即作废）
@@ -1593,130 +1537,50 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
 
 
 def process_exit_rules(con, trade_date: date) -> List[Tuple]:
-    holdings = con.execute("SELECT symbol, buy_date, buy_price, buy_price_hfq, shares, atr_pct_buy FROM virtual_portfolio").df()
-    if holdings.empty:
-        return []
-    holdings["buy_date"] = pd.to_datetime(holdings["buy_date"], errors="coerce")
-    holdings = holdings[holdings["buy_date"].notna()].copy()
-    holdings["buy_date"] = holdings["buy_date"].dt.date
-    holdings = holdings[holdings["buy_date"] < trade_date].copy()
-    if holdings.empty:
-        return []
-    symbols = holdings['symbol'].tolist()
-    placeholders = ','.join(['?'] * len(symbols))
-    start_date = (trade_date - timedelta(days=60)).strftime('%Y-%m-%d')
-    qfq_df = con.execute(f"""
-        WITH raw_data AS (
-            SELECT symbol, date, open, high, low, close
-            FROM daily_qfq_cache
-            WHERE symbol IN ({placeholders}) AND date BETWEEN ? AND ?
-        ),
-        indicators AS (
-            SELECT *,
-                   AVG(close) OVER w20 AS ma20_f,
-                   STDDEV(close) OVER w20 AS std20
-            FROM raw_data
-            WINDOW w20 AS (PARTITION BY symbol ORDER BY date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)
-        )
-        SELECT *, (ma20_f - 2 * std20) AS bb_lower
-        FROM indicators
-        ORDER BY symbol, date
-    """, symbols + [start_date, trade_date.strftime('%Y-%m-%d')]).df()
-    hfq_df = con.execute(f"""
-        SELECT symbol, date, close
-        FROM daily_hfq_cache
-        WHERE symbol IN ({placeholders}) AND date BETWEEN ? AND ?
-        ORDER BY symbol, date
-    """, symbols + [start_date, trade_date.strftime('%Y-%m-%d')]).df()
-
-    raw_today = con.execute(f"SELECT symbol, close FROM {STOCKS_TABLE} WHERE tradedate = ?", [trade_date]).df()
-    if not raw_today.empty:
-        raw_today["symbol"] = raw_today["symbol"].map(canonical_symbol)
-    raw_map = {row['symbol']: float(row['close']) for _, row in raw_today.iterrows()} if not raw_today.empty else {}
-    if qfq_df.empty:
-        return []
-    qfq_df['date'] = pd.to_datetime(qfq_df['date'])
-    if not hfq_df.empty:
-        hfq_df['date'] = pd.to_datetime(hfq_df['date'])
-    sold_rows = []
-    init_cap, total_assets, avail_cash = get_account_state(con)
-    sell_fee_rate = float(CONFIG.get("sell_fee_rate", 0.0010))
-    atr_stop_beta = float(CONFIG.get("atr_stop_loss_beta", 2.0))
-
-    for _, row in holdings.iterrows():
-        sym = row['symbol']
-        buy_date = pd.to_datetime(row['buy_date']).date()
-        buy_price = float(row['buy_price'])
-        buy_price_hfq = float(row['buy_price_hfq']) if not pd.isna(row['buy_price_hfq']) else buy_price
-        shares = int(row['shares'])
-        atr_pct_buy = float(row['atr_pct_buy']) if 'atr_pct_buy' in row and not pd.isna(row['atr_pct_buy']) and float(row['atr_pct_buy']) > 0 else 0.03
-
-        gq = qfq_df[qfq_df['symbol'] == sym].copy()
-        if gq.empty:
-            continue
-        gh = hfq_df[hfq_df['symbol'] == sym].copy() if not hfq_df.empty else pd.DataFrame()
-        gq['close'] = gq['close'].astype(float)
-        last_q = gq.iloc[-1]
-        last_close_qfq = float(last_q['close'])
-
-        last_close_hfq = float(gh.iloc[-1]['close']) if not gh.empty else last_close_qfq
-        hold_days = (trade_date - buy_date).days
-        pnl_pct = (last_close_hfq - buy_price_hfq) / buy_price_hfq * 100 if buy_price_hfq > 0 else 0.0
-        reason_mask = 0
-
-        # ── 动态 ATR 触发止损逻辑 ──
-        dynamic_stop_loss_limit_pct = -1.0 * atr_stop_beta * atr_pct_buy * 100.0
-        if pnl_pct <= dynamic_stop_loss_limit_pct:
-            reason_mask |= REASON_STOPLOSS
-
-        last_close_f = float(last_q['close'])
-        prev_close_f = float(gq.iloc[-2]['close']) if len(gq) >= 2 else last_close_f
-        last_mid = float(last_q['ma20_f']) if not pd.isna(last_q['ma20_f']) else 0
-        ma20_float = float(last_q['ma20_f']) if not pd.isna(last_q['ma20_f']) else None
-
-        if ma20_float is not None and last_close_qfq < ma20_float:
-            reason_mask |= REASON_BELOW_MA20
-        if hold_days >= CONFIG['max_hold_days']:
-            reason_mask |= REASON_MAX_HOLD
-
-        if last_mid > 0 and prev_close_f > last_mid and last_close_f < last_mid:
-            reason_mask |= REASON_BELOW_BOLL_MID
-
-        o_s = gq['open'].astype(float).tail(15)
-        h_s = gq['high'].astype(float).tail(15)
-        l_s = gq['low'].astype(float).tail(15)
-        c_s = gq['close'].tail(15)
-        bull_text, bull_score, bear_text, bear_score = detect_kline_patterns(o_s, h_s, l_s, c_s)
-
-        if bear_score >= 1.0:
-            reason_mask |= REASON_BEAR_PATTERN
-
-        if talib is not None and len(gq) > 30:
-            c_vals = gq['close'].values.astype(np.float64)
-            macd, macdsignal, macdhist = talib.MACD(c_vals, fastperiod=12, slowperiod=26, signalperiod=9)
-            if not pd.isna(macdhist[-1]) and not pd.isna(macdhist[-2]):
-                if macdhist[-1] < macdhist[-2]:
-                    reason_mask |= REASON_MACD_DECREASE
-
-        if reason_mask > 0:
-            sell_price_raw = raw_map.get(sym, last_close_qfq)
-            sold_rows.append((sym, trade_date, last_close_qfq, shares, reason_mask, round(pnl_pct, 2), sell_price_raw))
-
-    for sym, sell_date, sell_price, shares, reason_mask, pnl_pct, sell_price_raw in sold_rows:
-        con.execute('DELETE FROM virtual_portfolio WHERE symbol=?', [sym])
-        gross_cash = round(shares * sell_price_raw, 2)
-        sell_fee = round(gross_cash * sell_fee_rate, 2)
-        recovered_cash = round(gross_cash - sell_fee, 2)
-        con.execute("""
-            INSERT INTO trade_history(symbol, trade_type, signal_date, trade_date, price, shares, reason, pnl_pct, fee)
-            VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
-        """, [sym, TRADE_SELL, sell_date, round(sell_price, 2), shares, reason_mask, pnl_pct, round(sell_fee, 2)])
-        avail_cash += recovered_cash
-
-    if sold_rows:
-        con.execute("UPDATE account_state SET available_cash=? WHERE id=1", [avail_cash])
-    return sold_rows
-
+    """硬止损、保本、两级分批止盈、Trailing ATR 止盈及趋势破位离场。"""
+    holdings=con.execute("SELECT symbol,buy_date,buy_price,buy_price_hfq,shares,atr_pct_buy,highest_price_hfq,take_profit_stage FROM virtual_portfolio").df()
+    if holdings.empty: return []
+    holdings["buy_date"]=pd.to_datetime(holdings["buy_date"]).dt.date
+    holdings=holdings[holdings["buy_date"]<trade_date]
+    if holdings.empty: return []
+    syms=holdings.symbol.tolist(); ph=','.join(['?']*len(syms)); start=(trade_date-timedelta(days=70)).strftime('%Y-%m-%d')
+    qfq=con.execute(f"""SELECT symbol,date,open,high,low,close,AVG(close) OVER w20 AS ma20,STDDEV(close) OVER w20 AS std20
+    FROM daily_qfq_cache WHERE symbol IN ({ph}) AND date BETWEEN ? AND ?
+    WINDOW w20 AS(PARTITION BY symbol ORDER BY date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) ORDER BY symbol,date""",syms+[start,trade_date.strftime('%Y-%m-%d')]).df()
+    hfq=con.execute(f"SELECT symbol,date,close FROM daily_hfq_cache WHERE symbol IN ({ph}) AND date BETWEEN ? AND ? ORDER BY symbol,date",syms+[start,trade_date.strftime('%Y-%m-%d')]).df()
+    raw=con.execute(f"SELECT symbol,close FROM {STOCKS_TABLE} WHERE tradedate=?",[trade_date]).df()
+    raw_map=dict(zip(raw.symbol.map(canonical_symbol),raw.close)) if not raw.empty else {}
+    sold=[]; fee_rate=float(CONFIG['sell_fee_rate']); _,_,cash=get_account_state(con)
+    for _,h in holdings.iterrows():
+        g=qfq[qfq.symbol==h.symbol]; gh=hfq[hfq.symbol==h.symbol]
+        if g.empty: continue
+        last=g.iloc[-1]; close_q=float(last.close); close_h=float(gh.iloc[-1].close) if not gh.empty else close_q
+        buy_h=float(h.buy_price_hfq) if pd.notna(h.buy_price_hfq) else float(h.buy_price)
+        highest=float(h.highest_price_hfq) if pd.notna(h.highest_price_hfq) else buy_h
+        highest=max(highest,close_h); con.execute("UPDATE virtual_portfolio SET highest_price_hfq=? WHERE symbol=?",[highest,h.symbol])
+        pnl=(close_h/buy_h-1)*100 if buy_h>0 else 0.; peak=(highest/buy_h-1)*100 if buy_h>0 else 0.
+        atr=float(h.atr_pct_buy) if pd.notna(h.atr_pct_buy) and h.atr_pct_buy>0 else .03
+        stage=int(h.take_profit_stage) if pd.notna(h.take_profit_stage) else 0
+        reason=0; sell_shares=0; shares=int(h.shares)
+        # 风险优先级：ATR初始止损；浮盈>=8%后成本线保本；达到Trailing条件时清余仓。
+        if pnl <= -float(CONFIG['atr_stop_loss_beta'])*atr*100: reason|=REASON_STOPLOSS; sell_shares=shares
+        elif peak>=float(CONFIG['breakeven_trigger_pct']) and pnl<=0: reason|=REASON_STOPLOSS; sell_shares=shares
+        elif peak>=float(CONFIG['trailing_stop_start_pct']) and (peak-pnl)>=float(CONFIG['trailing_stop_atr_mult'])*atr*100: reason|=REASON_MAX_HOLD; sell_shares=shares
+        elif close_q<float(last.ma20): reason|=REASON_BELOW_MA20; sell_shares=shares
+        elif (trade_date-h.buy_date).days>=int(CONFIG['max_hold_days']): reason|=REASON_MAX_HOLD; sell_shares=shares
+        # 分批止盈仅在没有硬退出时发生，并持久记录阶段，避免每天重复卖出。
+        elif stage==0 and pnl>=float(CONFIG['partial_take_profit_1_pct']):
+            sell_shares=max(100,int(shares*float(CONFIG['partial_take_profit_1_ratio'])/100)*100); sell_shares=min(sell_shares,shares); stage=1
+        elif stage==1 and pnl>=float(CONFIG['partial_take_profit_2_pct']):
+            sell_shares=max(100,int(shares*float(CONFIG['partial_take_profit_2_ratio'])/100)*100); sell_shares=min(sell_shares,shares); stage=2
+        if sell_shares<100: continue
+        price=float(raw_map.get(h.symbol,close_q)); gross=round(price*sell_shares,2); fee=round(gross*fee_rate,2)
+        if sell_shares>=shares: con.execute("DELETE FROM virtual_portfolio WHERE symbol=?",[h.symbol])
+        else: con.execute("UPDATE virtual_portfolio SET shares=shares-?,take_profit_stage=? WHERE symbol=?",[sell_shares,stage,h.symbol])
+        con.execute("INSERT INTO trade_history(symbol,trade_type,signal_date,trade_date,price,shares,reason,pnl_pct,fee) VALUES(?,?,NULL,?,?,?,?,?,?)",[h.symbol,TRADE_SELL,trade_date,price,sell_shares,reason,round(pnl,2),fee])
+        cash+=gross-fee; sold.append((h.symbol,sell_shares,price,pnl,reason))
+    if sold: con.execute("UPDATE account_state SET available_cash=? WHERE id=1",[cash])
+    return sold
 
 def compute_all_signals(con, target_date: date) -> pd.DataFrame:
     start_date = (target_date - timedelta(days=120)).strftime("%Y-%m-%d")
@@ -1781,6 +1645,7 @@ def compute_all_signals(con, target_date: date) -> pd.DataFrame:
       AND vol_ma5_1 IS NOT NULL
       AND volume > vol_ma5_1
       AND close > 0
+      AND close <= ma20 * 1.12
       AND ma20 IS NOT NULL
       AND atr14 IS NOT NULL
     """
@@ -1863,7 +1728,13 @@ def compute_all_signals(con, target_date: date) -> pd.DataFrame:
     # 防御边界处理
     picks["planned_buy_price"] = np.where(picks["planned_buy_price"] <= 0, (picks["close"] * 0.99).round(2), picks["planned_buy_price"])
 
-    picks["total_score"] = (picks["ret_20d"] * 100.0).round(2)
+    # 复合评分：突破力度40% + 量比30% + 布林开口速度30%；不再按20日涨幅追高。
+    picks["breakout_strength"] = np.where(picks["atr14"] > 0, (picks["close"] - picks["ma20"]) / picks["atr14"], 0.0)
+    picks["boll_open_speed"] = np.where(picks["band_width_1"] > 0, (picks["band_width"] - picks["band_width_1"]) / picks["band_width_1"], 0.0)
+    picks["breakout_rank"] = picks["breakout_strength"].rank(pct=True)
+    picks["volume_rank"] = picks["vol_ratio"].rank(pct=True)
+    picks["boll_open_rank"] = picks["boll_open_speed"].rank(pct=True)
+    picks["total_score"] = (100.0 * (0.4 * picks["breakout_rank"] + 0.3 * picks["volume_rank"] + 0.3 * picks["boll_open_rank"])).round(2)
     picks["signal_strength"] = (picks["macd_strength"] + picks["vol_ratio"] + picks["bb_breakout"]).round(2)
     picks["close"] = picks["close"].round(2)
 
@@ -1886,7 +1757,6 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
         # （旧顺序为先买入后卖出，满仓时触价单被仓位上限拦截、即使当日有卖出也用不上空位）
         if allow_exit_on_date and int(history_before) > 0:
             process_exit_rules(con, target_date)
-            enforce_market_risk_rebalance(con, target_date)
         else:
             log.info(f"🛡️ 初始交易日 {target_date} 仅允许买入，跳过卖出规则")
         process_pending_orders(con, target_date)
@@ -2418,7 +2288,7 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
     <span class="pill buy">挂单：T日收盘 - {CONFIG['atr_buy_alpha']}×ATR(14)</span>
     <span class="pill sell">动态止损：-{CONFIG['atr_stop_loss_beta']}×ATR_pct</span>
     <span class="pill">仓位：风险平价 Risk Parity</span>
-    <span class="pill">风控：大盘多级受控（100%/50%/30%/10%/0%）</span>
+    <span class="pill">风控：大盘多级受控（100%/50%/30%）</span>
     <span class="pill sell">跌破 MA20 离场</span>
     <span class="pill sell">最长持有 {CONFIG['max_hold_days']} 天</span>
     <span class="pill">选股 Top {CONFIG['top_n']}</span>
