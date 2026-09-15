@@ -301,7 +301,7 @@ def _check_and_fix_pk(
     expected_pk: List[str],
     create_sql: str,
 ) -> None:
-    """Ensure a table has the required primary key, migrating data if needed."""
+    """Ensure a table has the required primary-key column set, migrating if needed."""
     existing_tables = {row[0] for row in con.execute("SHOW TABLES").fetchall()}
     if table_name not in existing_tables:
         con.execute(create_sql)
@@ -309,12 +309,15 @@ def _check_and_fix_pk(
         return
 
     table_info = con.execute(f'PRAGMA table_info("{table_name}")').fetchall()
-    actual_pk = [
-        row[1]
-        for row in sorted(table_info, key=lambda row: int(row[5] or 0))
-        if int(row[5] or 0) > 0
-    ]
-    if actual_pk == expected_pk:
+    actual_pk = [row[1] for row in table_info if int(row[5] or 0) > 0]
+
+    # DuckDB 的 PRAGMA table_info() 只能可靠地标识主键字段集合；
+    # 返回的行顺序是物理字段顺序，不保证复合主键的声明顺序。
+    has_expected_pk = (
+        len(actual_pk) == len(expected_pk)
+        and set(actual_pk) == set(expected_pk)
+    )
+    if has_expected_pk:
         return
 
     log.warning(
@@ -355,6 +358,7 @@ def _check_and_fix_pk(
         con.execute(f'DROP TABLE IF EXISTS "{tmp_name}"')
         con.execute(f'DROP TABLE IF EXISTS "{legacy_bad_tmp_name}"')
         con.execute(tmp_create_sql)
+
         con.execute(f"""
             INSERT INTO "{tmp_name}" ({quoted_columns})
             SELECT {quoted_columns}
@@ -378,14 +382,15 @@ def _check_and_fix_pk(
         con.execute(f'ALTER TABLE "{tmp_name}" RENAME TO "{table_name}"')
 
         migrated_info = con.execute(f'PRAGMA table_info("{table_name}")').fetchall()
-        migrated_pk = [
-            row[1]
-            for row in sorted(migrated_info, key=lambda row: int(row[5] or 0))
-            if int(row[5] or 0) > 0
-        ]
-        if migrated_pk != expected_pk:
+        migrated_pk = [row[1] for row in migrated_info if int(row[5] or 0) > 0]
+        migration_ok = (
+            len(migrated_pk) == len(expected_pk)
+            and set(migrated_pk) == set(expected_pk)
+        )
+        if not migration_ok:
             raise RuntimeError(
-                f"表 [{table_name}] 主键迁移校验失败：实际={migrated_pk}，期望={expected_pk}"
+                f"表 [{table_name}] 主键迁移校验失败："
+                f"实际={migrated_pk}，期望字段={expected_pk}"
             )
 
         con.execute("COMMIT")
@@ -399,7 +404,7 @@ def _check_and_fix_pk(
         else:
             log.info(
                 f"✅ 表 [{table_name}] 主键迁移完成：已保留 {new_count:,} 行数据，"
-                f"主键={expected_pk}"
+                f"主键字段={expected_pk}"
             )
     except Exception:
         try:
