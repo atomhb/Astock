@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 A股多头共振策略 + 200交易日滚动回测系统
-1. 自动回测：当数据库无数据时，自动拉取历史行情并回测近 200 个交易日。
+1. 自动回测：当数据库无历史记录时，自动拉取行情并回测近 200 个交易日。
 2. 选股策略要求：
    - 均线多头排列 (MA5 > MA10 > MA20 > MA60)
    - MA20 升穿 / 金叉向上发散 MA60
@@ -13,6 +13,7 @@ A股多头共振策略 + 200交易日滚动回测系统
    - 上升行情：持仓 80%-90% (基准 85%)
    - 下降行情：持仓上限必须压缩至 30%（触发强制减仓再平衡）
 4. 离场保护：动态 ATR 止损 + 保本止损 + Trailing ATR 移动止盈 + MACD 死叉离场。
+5. 修复 DuckDB 缺失主键时的 Binder Error 异常，增强历史表无损迁移能力。
 """
 import os
 import sys
@@ -292,10 +293,40 @@ class OneDriveClient:
                     pbar.update(len(chunk))
 
 # =========================================================
-# 数据库核心表管理
+# 数据库表结构体检与主键自动无损迁移
 # =========================================================
+def _check_and_fix_pk(con, table_name: str, expected_pk: List[str], create_sql: str):
+    """
+    检查表是否存在且是否具备完整的 PRIMARY KEY。
+    如果表存在但缺少主键（常见于历史旧库），自动执行无损去重并重建主键，杜绝 Binder Error。
+    """
+    tables = [t[0] for t in con.execute("SHOW TABLES").fetchall()]
+    if table_name not in tables:
+        con.execute(create_sql)
+        return
+
+    cols = con.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+    actual_pk = [c[1] for c in cols if len(c) > 5 and c[5] > 0]
+    if set(actual_pk) != set(expected_pk):
+        log.warning(f"🔄 检测到表 [{table_name}] 缺少主键约束 (当前:{actual_pk}, 期望:{expected_pk})，执行全量无损迁移重建...")
+        tmp_name = f"{table_name}_pk_migration_tmp"
+        con.execute(f"DROP TABLE IF EXISTS {tmp_name}")
+        tmp_create_sql = create_sql.replace(f"CREATE TABLE IF NOT EXISTS {table_name}", f"CREATE TABLE {tmp_name}").replace(f"CREATE TABLE {table_name}", f"CREATE TABLE {tmp_name}")
+        con.execute(tmp_create_sql)
+        pk_expr = ", ".join(expected_pk)
+        where_cond = " AND ".join(f"{c} IS NOT NULL" for c in expected_pk)
+        con.execute(f"""
+            INSERT INTO {tmp_name}
+            SELECT DISTINCT ON ({pk_expr}) * FROM {table_name}
+            WHERE {where_cond}
+        """)
+        con.execute(f"DROP TABLE {table_name}")
+        con.execute(f"ALTER TABLE {tmp_name} RENAME TO {table_name}")
+        con.execute("CHECKPOINT")
+        log.info(f"✅ [{table_name}] 成功重建主键: {expected_pk}")
+
 def ensure_core_tables(con):
-    con.execute(f"""
+    stocks_sql = f"""
         CREATE TABLE IF NOT EXISTS {STOCKS_TABLE} (
             tradedate DATE,
             symbol VARCHAR,
@@ -308,15 +339,20 @@ def ensure_core_tables(con):
             amount FLOAT,
             PRIMARY KEY (symbol, tradedate)
         )
-    """)
-    con.execute(f"""
+    """
+    _check_and_fix_pk(con, STOCKS_TABLE, ["symbol", "tradedate"], stocks_sql)
+
+    adj_sql = f"""
         CREATE TABLE IF NOT EXISTS {ADJUSTMENT_FACTORS_TABLE} (
             tradedate DATE,
             symbol VARCHAR,
             hfq_factor DOUBLE,
             PRIMARY KEY (symbol, tradedate)
         )
-    """)
+    """
+    _check_and_fix_pk(con, ADJUSTMENT_FACTORS_TABLE, ["symbol", "tradedate"], adj_sql)
+
+    # 针对旧库回填 factor
     con.execute(f"""
         INSERT OR IGNORE INTO {ADJUSTMENT_FACTORS_TABLE} (tradedate, symbol, hfq_factor)
         SELECT tradedate, symbol, adjclose / NULLIF(close, 0)
@@ -325,7 +361,7 @@ def ensure_core_tables(con):
     """)
 
 def ensure_strategy_tables(con):
-    con.execute("""
+    pending_sql = """
         CREATE TABLE IF NOT EXISTS pending_orders (
             symbol VARCHAR,
             signal_date DATE,
@@ -337,8 +373,10 @@ def ensure_strategy_tables(con):
             atr_pct DOUBLE,
             PRIMARY KEY (symbol, signal_date)
         )
-    """)
-    con.execute("""
+    """
+    _check_and_fix_pk(con, "pending_orders", ["symbol", "signal_date"], pending_sql)
+
+    port_sql = """
         CREATE TABLE IF NOT EXISTS virtual_portfolio (
             symbol VARCHAR PRIMARY KEY,
             buy_date DATE,
@@ -348,7 +386,21 @@ def ensure_strategy_tables(con):
             atr_pct_buy DOUBLE,
             highest_price_hfq DOUBLE
         )
-    """)
+    """
+    _check_and_fix_pk(con, "virtual_portfolio", ["symbol"], port_sql)
+
+    account_hist_sql = """
+        CREATE TABLE IF NOT EXISTS account_history (
+            date DATE PRIMARY KEY,
+            total_assets DOUBLE,
+            available_cash DOUBLE,
+            daily_pnl DOUBLE,
+            daily_ret DOUBLE,
+            market_value DOUBLE
+        )
+    """
+    _check_and_fix_pk(con, "account_history", ["date"], account_hist_sql)
+
     con.execute("""
         CREATE TABLE IF NOT EXISTS trade_history (
             symbol VARCHAR,
@@ -371,16 +423,6 @@ def ensure_strategy_tables(con):
             updated_at DATE
         )
     """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS account_history (
-            date DATE PRIMARY KEY,
-            total_assets DOUBLE,
-            available_cash DOUBLE,
-            daily_pnl DOUBLE,
-            daily_ret DOUBLE,
-            market_value DOUBLE
-        )
-    """)
     cnt = con.execute("SELECT count(*) FROM account_state").fetchone()[0]
     if cnt == 0:
         con.execute(f"INSERT INTO account_state(id, init_capital, total_assets, available_cash, updated_at) VALUES (1, {CONFIG['init_cash']}, {CONFIG['init_cash']}, {CONFIG['init_cash']}, CURRENT_DATE)")
@@ -392,7 +434,7 @@ def initialize_empty_database(db_path: str):
         con.execute("CHECKPOINT")
 
 # =========================================================
-# 行情数据获取与同步
+# 行情数据获取与写入（安全幂等）
 # =========================================================
 def prepare_latest_qlib_data() -> str:
     session = build_retry_session()
@@ -485,26 +527,36 @@ def investment_data_sync(db_path: str, target_date: date, trade_days: int) -> Tu
         except Exception:
             pass
         con.register("tmp_new_stocks", window_df)
+
+        # 【核心修复】安全幂等写入：先 DELETE 冲突行，再 INSERT，彻底规避 Binder Error
         con.execute(f"""
-            INSERT OR REPLACE INTO {STOCKS_TABLE} (tradedate, symbol, high, low, open, close, adjclose, volume, amount)
+            DELETE FROM {STOCKS_TABLE}
+            WHERE (symbol, tradedate) IN (SELECT symbol, tradedate FROM tmp_new_stocks)
+        """)
+        con.execute(f"""
+            INSERT INTO {STOCKS_TABLE} (tradedate, symbol, high, low, open, close, adjclose, volume, amount)
             SELECT tradedate, symbol, high, low, open, close, adjclose, volume, amount
             FROM tmp_new_stocks
         """)
         con.execute(f"""
-            INSERT OR REPLACE INTO {ADJUSTMENT_FACTORS_TABLE} (tradedate, symbol, hfq_factor)
+            DELETE FROM {ADJUSTMENT_FACTORS_TABLE}
+            WHERE (symbol, tradedate) IN (SELECT symbol, tradedate FROM tmp_new_stocks)
+        """)
+        con.execute(f"""
+            INSERT INTO {ADJUSTMENT_FACTORS_TABLE} (tradedate, symbol, hfq_factor)
             SELECT tradedate, symbol, adjclose / NULLIF(close, 0)
             FROM tmp_new_stocks
             WHERE close > 0 AND adjclose > 0
         """)
         con.execute("CHECKPOINT")
-    log.info(f"✅ 行情同步完成: 记录数={len(window_df)}, 覆盖天数={len(trade_dates)}")
+    log.info(f"✅ 行情同步成功: 记录数={len(window_df)}, 覆盖交易日={len(trade_dates)}天")
     return True, trade_dates
 
 # =========================================================
 # 高性能复权与缓存管理
 # =========================================================
 def ensure_hfq_cache_built(con, start_date: date, end_date: date):
-    """全量预热构建 HFQ 后复权缓存表（带索引，整个回测过程仅需建一次）"""
+    """全量预热构建 HFQ 后复权缓存表（回测全程仅建一次索引）"""
     con.execute("DROP TABLE IF EXISTS daily_hfq_cache")
     con.execute(f"""
         CREATE TABLE daily_hfq_cache AS
@@ -931,7 +983,7 @@ def process_pending_orders(con, trade_date: date, max_allowed_equity: float):
         atr_pct = float(row['atr_pct'] or 0.03)
 
         n_days = con.execute(f"SELECT COUNT(DISTINCT tradedate) FROM {STOCKS_TABLE} WHERE tradedate > ? AND tradedate <= ?", [signal_date, trade_date]).fetchone()[0]
-        if n_days > CONFIG["buy_signal_expire_days"] or symbol in holding_symbols or symbol in q_map == False:
+        if n_days > CONFIG["buy_signal_expire_days"] or symbol in holding_symbols or (symbol in q_map) == False:
             continue
 
         row_t1 = q_map[symbol]
@@ -968,8 +1020,9 @@ def process_pending_orders(con, trade_date: date, max_allowed_equity: float):
 
     if filled_rows:
         con.execute("UPDATE account_state SET available_cash=? WHERE id=1", [avail_cash])
+        con.executemany("DELETE FROM virtual_portfolio WHERE symbol = ?", [(r[0],) for r in filled_rows])
         con.executemany("""
-            INSERT OR REPLACE INTO virtual_portfolio(symbol, buy_date, buy_price, buy_price_hfq, shares, atr_pct_buy, highest_price_hfq)
+            INSERT INTO virtual_portfolio(symbol, buy_date, buy_price, buy_price_hfq, shares, atr_pct_buy, highest_price_hfq)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, [(s, d, bp, bph, sh, atr, bph) for s, d, bp, bph, sh, _, atr in filled_rows])
         for s, d, bp, bph, sh, fee, _ in filled_rows:
@@ -1017,7 +1070,8 @@ def evaluate_strategy_day(db_path: str, target_date: date, allow_exit: bool = Tr
                 if row["symbol"] not in holding_symbols:
                     new_orders.append((row["symbol"], target_date, round(float(row["planned_buy_price"]), 2), round(float(row["close"]), 2), TRADE_BUY, STATUS_PENDING, float(row["signal_strength"]), float(row["atr_pct"])))
             if new_orders:
-                con.executemany("INSERT OR REPLACE INTO pending_orders VALUES (?, ?, ?, ?, ?, ?, ?, ?)", new_orders)
+                con.executemany("DELETE FROM pending_orders WHERE symbol = ? AND signal_date = ?", [(r[0], r[1]) for r in new_orders])
+                con.executemany("INSERT INTO pending_orders VALUES (?, ?, ?, ?, ?, ?, ?, ?)", new_orders)
 
         holdings = con.execute("SELECT * FROM virtual_portfolio ORDER BY symbol").df()
         if holdings.empty:
@@ -1044,8 +1098,9 @@ def evaluate_strategy_day(db_path: str, target_date: date, allow_exit: bool = Tr
         daily_pnl = new_total_assets - prev_assets
         daily_ret = daily_pnl / prev_assets if prev_assets > 0 else 0.0
 
+        con.execute("DELETE FROM account_history WHERE date = ?", [target_date])
         con.execute("""
-            INSERT OR REPLACE INTO account_history(date, total_assets, available_cash, daily_pnl, daily_ret, market_value)
+            INSERT INTO account_history(date, total_assets, available_cash, daily_pnl, daily_ret, market_value)
             VALUES (?, ?, ?, ?, ?, ?)
         """, [target_date, round(new_total_assets, 2), round(avail_cash, 2), round(daily_pnl, 2), round(daily_ret, 4), round(total_market_val, 2)])
 
@@ -1082,18 +1137,15 @@ def compute_backtest_analytics_and_chart(db_path: str, init_cap: float) -> Tuple
     total_ret = (assets_arr[-1] / init_cap) - 1.0
     ann_ret = (1.0 + total_ret) ** (250.0 / max(n_days, 1)) - 1.0
 
-    # 回撤计算
     peaks = np.maximum.accumulate(assets_arr)
     drawdowns = (peaks - assets_arr) / peaks
     max_dd = float(np.max(drawdowns))
 
-    # 夏普与卡玛
     mean_daily = hist_df['daily_ret'].mean()
     std_daily = hist_df['daily_ret'].std()
     sharpe = float((mean_daily - 0.018 / 250.0) / std_daily * np.sqrt(250.0)) if std_daily > 0 else 0.0
     calmar = float(ann_ret / max_dd) if max_dd > 0 else 0.0
 
-    # 交易胜率与盈亏比
     total_trades = len(trades_df)
     win_trades = len(trades_df[trades_df['pnl_pct'] > 0]) if total_trades > 0 else 0
     win_rate = (win_trades / total_trades * 100.0) if total_trades > 0 else 0.0
@@ -1109,13 +1161,11 @@ def compute_backtest_analytics_and_chart(db_path: str, init_cap: float) -> Tuple
         "profit_factor": round(profit_factor, 2)
     }
 
-    # 绘制双子图净值与回撤曲线
     chart_b64 = None
     try:
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=True, gridspec_kw={'height_ratios': [2.5, 1]})
         net_values = assets_arr / init_cap
 
-        # 净值主图
         ax1.plot(hist_df['date'], net_values, label=f'策略净值 (Sharpe: {sharpe:.2f})', color='#2563eb', linewidth=1.8)
         ax1.axhline(1.0, linestyle='--', color='#94a3b8', linewidth=1.0)
         ax1.set_title(f"A股多头共振策略 {n_days} 交易日回测 | 累计收益: {total_ret*100:+.1f}% (年化: {ann_ret*100:+.1f}%) | 最大回撤: -{max_dd*100:.1f}%", fontsize=12)
@@ -1123,7 +1173,6 @@ def compute_backtest_analytics_and_chart(db_path: str, init_cap: float) -> Tuple
         ax1.set_ylabel('净值 (Net Value)')
         ax1.legend(loc='upper left')
 
-        # 水下回撤图
         ax2.fill_between(hist_df['date'], -drawdowns * 100.0, 0, color='#ef4444', alpha=0.35, label='动态回撤 (Drawdown %)')
         ax2.set_ylabel('回撤 %')
         ax2.grid(True, linestyle=':', alpha=0.6)
