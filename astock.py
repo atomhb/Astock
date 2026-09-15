@@ -95,7 +95,7 @@ CONFIG = {
     "adjust_cache_days": 320,
     "source_cache_ttl_seconds": 6 * 3600,
     "update_window_trade_days": 150,
-    "initial_replay_trade_days": 90,       # 初始回测天数
+    "initial_replay_trade_days": 200,       # 初始回测天数
     "buy_fee_rate": 0.0005,
     "sell_fee_rate": 0.0010,
 
@@ -1006,8 +1006,13 @@ def _clean_dolthub_chunk(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
-    STREAM_CHUNK_ROWS = 50_000
-    DOWNLOAD_CHUNK_KB = 512
+    # CSV 每次解析 20 万行。
+    # 50,000 行较保守；全量 A 股历史下载时会产生较多 Pandas → DuckDB 写入循环。
+    STREAM_CHUNK_ROWS = 1000_000
+    
+    # requests 每次从网络接收 4 MB。
+    # 单位为 KB，因此 4096 = 4 × 1024 KB = 4 MB。
+    DOWNLOAD_CHUNK_KB = 10 * 1024
 
     # 首次无数据库的全历史初始化必须使用 ts_a_stock_eod_price。
     # 该表覆盖 1990-12-19 起的A股历史；不要改为 final_a_stock_eod_price。
