@@ -35,6 +35,42 @@ import requests
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
+
+
+def configure_matplotlib_chinese_font() -> None:
+    """Configure a CJK-capable font for plots, including GitHub Actions Ubuntu."""
+    candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttf",
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+        "/System/Library/Fonts/PingFang.ttc",
+    ]
+    for font_path in candidates:
+        if os.path.isfile(font_path):
+            font_manager.fontManager.addfont(font_path)
+            font_name = font_manager.FontProperties(fname=font_path).get_name()
+            matplotlib.rcParams["font.family"] = "sans-serif"
+            matplotlib.rcParams["font.sans-serif"] = [font_name, "DejaVu Sans"]
+            matplotlib.rcParams["axes.unicode_minus"] = False
+            logging.getLogger(__name__).info(
+                f"✅ Matplotlib 中文字体已启用: {font_name} ({font_path})"
+            )
+            return
+    matplotlib.rcParams["font.family"] = "sans-serif"
+    matplotlib.rcParams["font.sans-serif"] = ["DejaVu Sans"]
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    logging.getLogger(__name__).warning(
+        "⚠️ 未发现可用中文字体；图表中文将显示为方框。"
+        "GitHub Actions 请安装 fonts-noto-cjk。"
+    )
+
+
+configure_matplotlib_chinese_font()
 import matplotlib.dates as mdates
 from dotenv import load_dotenv
 from tqdm import tqdm
@@ -310,9 +346,6 @@ def _check_and_fix_pk(
 
     table_info = con.execute(f'PRAGMA table_info("{table_name}")').fetchall()
     actual_pk = [row[1] for row in table_info if int(row[5] or 0) > 0]
-
-    # DuckDB 的 PRAGMA table_info() 只能可靠地标识主键字段集合；
-    # 返回的行顺序是物理字段顺序，不保证复合主键的声明顺序。
     has_expected_pk = (
         len(actual_pk) == len(expected_pk)
         and set(actual_pk) == set(expected_pk)
@@ -324,7 +357,6 @@ def _check_and_fix_pk(
         f"🔄 检测到表 [{table_name}] 主键不符合预期 "
         f"(当前:{actual_pk}, 期望:{expected_pk})，执行全量无损迁移重建..."
     )
-
     tmp_name = f"__{table_name}_pk_migration_tmp"
     legacy_bad_tmp_name = f"{table_name}_pk_migration_tmp_pk_migration_tmp"
     prefix_if_not_exists = f"CREATE TABLE IF NOT EXISTS {table_name}"
@@ -346,7 +378,6 @@ def _check_and_fix_pk(
     all_columns = [row[1] for row in table_info]
     if not all_columns:
         raise RuntimeError(f"表 [{table_name}] 存在，但无法读取字段信息。")
-
     quoted_columns = ", ".join(f'"{column}"' for column in all_columns)
     quoted_pk_columns = ", ".join(f'"{column}"' for column in expected_pk)
     pk_not_null_condition = " AND ".join(
@@ -358,26 +389,22 @@ def _check_and_fix_pk(
         con.execute(f'DROP TABLE IF EXISTS "{tmp_name}"')
         con.execute(f'DROP TABLE IF EXISTS "{legacy_bad_tmp_name}"')
         con.execute(tmp_create_sql)
-
         con.execute(f"""
             INSERT INTO "{tmp_name}" ({quoted_columns})
             SELECT {quoted_columns}
             FROM (
-                SELECT
-                    {quoted_columns},
-                    ROW_NUMBER() OVER (
-                        PARTITION BY {quoted_pk_columns}
-                        ORDER BY rowid DESC
-                    ) AS _rn
+                SELECT {quoted_columns},
+                       ROW_NUMBER() OVER (
+                           PARTITION BY {quoted_pk_columns}
+                           ORDER BY rowid DESC
+                       ) AS _rn
                 FROM "{table_name}"
                 WHERE {pk_not_null_condition}
             ) AS dedup
             WHERE _rn = 1
         """)
-
         old_count = con.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
         new_count = con.execute(f'SELECT COUNT(*) FROM "{tmp_name}"').fetchone()[0]
-
         con.execute(f'DROP TABLE "{table_name}"')
         con.execute(f'ALTER TABLE "{tmp_name}" RENAME TO "{table_name}"')
 
@@ -392,7 +419,6 @@ def _check_and_fix_pk(
                 f"表 [{table_name}] 主键迁移校验失败："
                 f"实际={migrated_pk}，期望字段={expected_pk}"
             )
-
         con.execute("COMMIT")
         con.execute("CHECKPOINT")
         removed_count = old_count - new_count
