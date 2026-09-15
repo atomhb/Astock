@@ -12,7 +12,7 @@ permissions:
 jobs:
   run-stock-analysis:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
 
     steps:
       - name: 检出代码
