@@ -2,13 +2,17 @@ name: A股每日量化分析
 
 on:
   schedule:
-    # 北京时间 19:00 = UTC 11:00，周一至周五
-    - cron: '30 10 * * 1-5'
-  workflow_dispatch:   # 允许手动触发
+    # GitHub Actions 的 cron 使用 UTC；UTC 11:00 = 北京时间 19:00（UTC+8）
+    - cron: '0 11 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   run-stock-analysis:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: 检出代码
@@ -19,30 +23,51 @@ jobs:
         with:
           python-version: '3.12'
           cache: 'pip'
-          
-      - name: Install TA-Lib C library
+          cache-dependency-path: requirements.txt
+
+      - name: 安装 TA-Lib C 库
+        shell: bash
         run: |
-          wget https://github.com/ta-lib/ta-lib/releases/download/v0.6.4/ta-lib_0.6.4_amd64.deb
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 \
+            -o ta-lib_0.6.4_amd64.deb \
+            'https://github.com/ta-lib/ta-lib/releases/download/v0.6.4/ta-lib_0.6.4_amd64.deb'
           sudo dpkg -i ta-lib_0.6.4_amd64.deb
           sudo ldconfig
-          
-      - name: 安装依赖
+          rm -f ta-lib_0.6.4_amd64.deb
+
+      - name: 安装 Matplotlib 中文字体
+        shell: bash
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fonts-noto-cjk fontconfig
+          fc-cache -f -v
+          fc-match 'Noto Sans CJK SC' || true
+
+      - name: 安装 Python 依赖
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
       - name: 运行每日任务
+        shell: bash
         env:
-          AZURE_CLIENT_ID:           ${{ secrets.AZURE_CLIENT_ID }}
-          ONEDRIVE_TOKEN_CACHE_B64:  ${{ secrets.ONEDRIVE_TOKEN_CACHE_B64 }}
-          EMAIL_TO:                  ${{ secrets.EMAIL_TO }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          ONEDRIVE_TOKEN_CACHE_B64: ${{ secrets.ONEDRIVE_TOKEN_CACHE_B64 }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          set -euo pipefail
+          python astock.py run
 
-        run: python astock.py run
-      
       - name: 上传运行日志
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: run-log-${{ github.run_number }}
-          path: "*.log"
+          path: |
+            *.log
+          if-no-files-found: warn
           retention-days: 7
