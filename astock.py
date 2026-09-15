@@ -486,15 +486,25 @@ def investment_data_sync(db_path: str, target_date: date, trade_days: int) -> Tu
             pass
         con.register("tmp_new_stocks", window_df)
         con.execute(f"""
-            INSERT OR REPLACE INTO {STOCKS_TABLE} (tradedate, symbol, high, low, open, close, adjclose, volume, amount)
+            INSERT INTO {STOCKS_TABLE} (tradedate, symbol, high, low, open, close, adjclose, volume, amount)
             SELECT tradedate, symbol, high, low, open, close, adjclose, volume, amount
             FROM tmp_new_stocks
+            ON CONFLICT (symbol, tradedate) DO UPDATE SET
+                high = EXCLUDED.high,
+                low = EXCLUDED.low,
+                open = EXCLUDED.open,
+                close = EXCLUDED.close,
+                adjclose = EXCLUDED.adjclose,
+                volume = EXCLUDED.volume,
+                amount = EXCLUDED.amount
         """)
         con.execute(f"""
-            INSERT OR REPLACE INTO {ADJUSTMENT_FACTORS_TABLE} (tradedate, symbol, hfq_factor)
+            INSERT INTO {ADJUSTMENT_FACTORS_TABLE} (tradedate, symbol, hfq_factor)
             SELECT tradedate, symbol, adjclose / NULLIF(close, 0)
             FROM tmp_new_stocks
             WHERE close > 0 AND adjclose > 0
+            ON CONFLICT (symbol, tradedate) DO UPDATE SET
+                hfq_factor = EXCLUDED.hfq_factor
         """)
         con.execute("CHECKPOINT")
     log.info(f"✅ 行情同步完成: 记录数={len(window_df)}, 覆盖天数={len(trade_dates)}")
