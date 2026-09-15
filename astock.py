@@ -14,19 +14,6 @@ A股多头共振策略 + 200交易日滚动回测系统
    - 下降行情：持仓上限必须压缩至 30%（触发强制减仓再平衡）
 4. 离场保护：动态 ATR 止损 + 保本止损 + Trailing ATR 移动止盈 + MACD 死叉离场。
 5. 修复 DuckDB 缺失主键时的 Binder Error 异常，增强历史表无损迁移能力。
-
-=== 本次升级新增内容 ===
-A. Matplotlib 中文字体自动探测，修复回测图表中文乱码(Tofu方框)问题。
-B. DuckDB 主键迁移函数修复：原实现连续两次 str.replace() 会把临时表名
-   错误叠加为 xxx_pk_migration_tmp_pk_migration_tmp，现改为单次替换 + 事务保护。
-C. 市场状态评分升级：加入市场广度动量减速项(D)，并用连续的"波动率目标仓位"
-   (volatility targeting) 替代原先 85%/50%/30% 的三档跳变仓位。
-D. 选股逻辑升级：在原有5类技术指标硬性过滤基础上，新增横截面动量因子打分
-   (波动率调整动量 + 60/120日动量 + 趋势质量 + 量能强度)，并增加质量/流动性
-   过滤，剔除当日候选池中最不稳定与流动性最差的一批标的，降低动量崩溃风险。
-E. 出场规则分级化：硬性风控(止损/保本/跟踪止盈/硬止盈/最长持有期)依旧全额清仓；
-   趋势结构走弱(连续两日跌破MA20 且 MA5<MA10)改为只减仓50%，避免单日正常回踩
-   被误判为趋势反转、导致换手率和误杀交易过高。
 """
 import os
 import sys
@@ -48,26 +35,11 @@ import requests
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 from matplotlib import font_manager
-from dotenv import load_dotenv
-from tqdm import tqdm
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-try:
-    import talib
-except Exception:
-    talib = None
-
-if talib is not None:
-    _orig_macd = talib.MACD
-    def _safe_macd(real, **kwargs):
-        return _orig_macd(np.asarray(real, dtype=np.float64), **kwargs)
-    talib.MACD = _safe_macd
 
 
 def configure_matplotlib_chinese_font() -> None:
-    """探测并启用可用的中文字体，避免图表中文显示为方框（Tofu）。"""
+    """Configure a CJK-capable font for plots, including GitHub Actions Ubuntu."""
     candidates = [
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
@@ -85,11 +57,35 @@ def configure_matplotlib_chinese_font() -> None:
             matplotlib.rcParams["font.family"] = "sans-serif"
             matplotlib.rcParams["font.sans-serif"] = [font_name, "DejaVu Sans"]
             matplotlib.rcParams["axes.unicode_minus"] = False
+            logging.getLogger(__name__).info(
+                f"✅ Matplotlib 中文字体已启用: {font_name} ({font_path})"
+            )
             return
     matplotlib.rcParams["font.family"] = "sans-serif"
     matplotlib.rcParams["font.sans-serif"] = ["DejaVu Sans"]
     matplotlib.rcParams["axes.unicode_minus"] = False
+    logging.getLogger(__name__).warning(
+        "⚠️ 未发现可用中文字体；图表中文将显示为方框。"
+        "GitHub Actions 请安装 fonts-noto-cjk。"
+    )
 
+
+configure_matplotlib_chinese_font()
+import matplotlib.dates as mdates
+from dotenv import load_dotenv
+from tqdm import tqdm
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+try:
+    import talib
+except Exception:
+    talib = None
+
+if talib is not None:
+    _orig_macd = talib.MACD
+    def _safe_macd(real, **kwargs):
+        return _orig_macd(np.asarray(real, dtype=np.float64), **kwargs)
+    talib.MACD = _safe_macd
 
 load_dotenv()
 # =========================================================
@@ -103,7 +99,6 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE, encoding="utf-8")],
 )
 log = logging.getLogger(__name__)
-configure_matplotlib_chinese_font()
 CN_TZ = timezone(timedelta(hours=8))
 IS_CI = os.getenv("CI", "").lower() in ("true", "1", "yes") or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -128,7 +123,7 @@ CONFIG = {
     "init_cash": 100000.0,
     "position_cash_yuan": 40000.0,
     "max_position_stocks": 6,
-    "initial_replay_trade_days": 100,      # 数据库为空时回测交易日数
+    "initial_replay_trade_days": 200,      # 数据库为空时回测交易日数
     "update_window_trade_days": 380,       # 行情同步窗口（覆盖200天回测+180天指标预热）
     "adjust_cache_days": 380,
     "top_n": 15,
@@ -194,7 +189,7 @@ def decode_reason_text(code) -> str:
     if code & REASON_REBALANCE:
         parts.append("⚠️大盘转熊强制降仓至30%")
     if code & REASON_BELOW_MA20:
-        parts.append("跌破MA20(趋势确认/部分或全部离场)")
+        parts.append("跌破MA20")
     if code & REASON_BELOW_BOLL_MID:
         parts.append("跌破布林中轨")
     if code & REASON_MAX_HOLD:
@@ -336,44 +331,58 @@ class OneDriveClient:
 # =========================================================
 # 数据库表结构体检与主键自动无损迁移
 # =========================================================
-def _check_and_fix_pk(con, table_name: str, expected_pk: List[str], create_sql: str):
-    """
-    检查表是否存在且是否具备完整的 PRIMARY KEY。
-    如果表存在但缺少主键（常见于历史旧库），自动执行无损去重并重建主键，杜绝 Binder Error。
-
-    修复说明：
-    - 原实现对 create_sql 做了连续两次 replace()，当第一次已把
-      "CREATE TABLE IF NOT EXISTS {table}" 替换为 "CREATE TABLE {tmp}" 后，
-      第二次 replace 会再次命中并把 tmp 表名错误地叠加后缀，
-      产生诸如 stock_prices_pk_migration_tmp_pk_migration_tmp 的错误表名。
-    - 这里改为只做一次替换，并用事务保护整个迁移过程。
-    """
-    tables = [t[0] for t in con.execute("SHOW TABLES").fetchall()]
-    if table_name not in tables:
+def _check_and_fix_pk(
+    con,
+    table_name: str,
+    expected_pk: List[str],
+    create_sql: str,
+) -> None:
+    """Ensure a table has the required primary-key column set, migrating if needed."""
+    existing_tables = {row[0] for row in con.execute("SHOW TABLES").fetchall()}
+    if table_name not in existing_tables:
         con.execute(create_sql)
+        log.info(f"✅ 已创建表 [{table_name}]，主键={expected_pk}")
         return
 
-    cols = con.execute(f"PRAGMA table_info('{table_name}')").fetchall()
-    actual_pk = [c[1] for c in cols if len(c) > 5 and c[5] > 0]
-    if set(actual_pk) == set(expected_pk) and len(actual_pk) == len(expected_pk):
+    table_info = con.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+    actual_pk = [row[1] for row in table_info if int(row[5] or 0) > 0]
+    has_expected_pk = (
+        len(actual_pk) == len(expected_pk)
+        and set(actual_pk) == set(expected_pk)
+    )
+    if has_expected_pk:
         return
 
-    log.warning(f"🔄 检测到表 [{table_name}] 主键不符合预期 (当前:{actual_pk}, 期望:{expected_pk})，执行全量无损迁移重建...")
-
+    log.warning(
+        f"🔄 检测到表 [{table_name}] 主键不符合预期 "
+        f"(当前:{actual_pk}, 期望:{expected_pk})，执行全量无损迁移重建..."
+    )
     tmp_name = f"__{table_name}_pk_migration_tmp"
     legacy_bad_tmp_name = f"{table_name}_pk_migration_tmp_pk_migration_tmp"
     prefix_if_not_exists = f"CREATE TABLE IF NOT EXISTS {table_name}"
     prefix_plain = f"CREATE TABLE {table_name}"
 
     if prefix_if_not_exists in create_sql:
-        tmp_create_sql = create_sql.replace(prefix_if_not_exists, f'CREATE TABLE "{tmp_name}"', 1)
+        tmp_create_sql = create_sql.replace(
+            prefix_if_not_exists, f'CREATE TABLE "{tmp_name}"', 1
+        )
     elif prefix_plain in create_sql:
-        tmp_create_sql = create_sql.replace(prefix_plain, f'CREATE TABLE "{tmp_name}"', 1)
+        tmp_create_sql = create_sql.replace(
+            prefix_plain, f'CREATE TABLE "{tmp_name}"', 1
+        )
     else:
-        raise ValueError(f"无法从 create_sql 中定位目标表 [{table_name}] 的 CREATE TABLE 语句。")
+        raise ValueError(
+            f"无法从 create_sql 中定位目标表 [{table_name}] 的 CREATE TABLE 语句。"
+        )
 
-    pk_expr = ", ".join(f'"{c}"' for c in expected_pk)
-    where_cond = " AND ".join(f'"{c}" IS NOT NULL' for c in expected_pk)
+    all_columns = [row[1] for row in table_info]
+    if not all_columns:
+        raise RuntimeError(f"表 [{table_name}] 存在，但无法读取字段信息。")
+    quoted_columns = ", ".join(f'"{column}"' for column in all_columns)
+    quoted_pk_columns = ", ".join(f'"{column}"' for column in expected_pk)
+    pk_not_null_condition = " AND ".join(
+        f'"{column}" IS NOT NULL' for column in expected_pk
+    )
 
     con.execute("BEGIN TRANSACTION")
     try:
@@ -381,28 +390,54 @@ def _check_and_fix_pk(con, table_name: str, expected_pk: List[str], create_sql: 
         con.execute(f'DROP TABLE IF EXISTS "{legacy_bad_tmp_name}"')
         con.execute(tmp_create_sql)
         con.execute(f"""
-            INSERT INTO "{tmp_name}"
-            SELECT DISTINCT ON ({pk_expr}) *
-            FROM "{table_name}"
-            WHERE {where_cond}
+            INSERT INTO "{tmp_name}" ({quoted_columns})
+            SELECT {quoted_columns}
+            FROM (
+                SELECT {quoted_columns},
+                       ROW_NUMBER() OVER (
+                           PARTITION BY {quoted_pk_columns}
+                           ORDER BY rowid DESC
+                       ) AS _rn
+                FROM "{table_name}"
+                WHERE {pk_not_null_condition}
+            ) AS dedup
+            WHERE _rn = 1
         """)
+        old_count = con.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
+        new_count = con.execute(f'SELECT COUNT(*) FROM "{tmp_name}"').fetchone()[0]
         con.execute(f'DROP TABLE "{table_name}"')
         con.execute(f'ALTER TABLE "{tmp_name}" RENAME TO "{table_name}"')
 
-        migrated_cols = con.execute(f"PRAGMA table_info('{table_name}')").fetchall()
-        migrated_pk = [c[1] for c in migrated_cols if len(c) > 5 and c[5] > 0]
-        if set(migrated_pk) != set(expected_pk) or len(migrated_pk) != len(expected_pk):
-            raise RuntimeError(f"表 [{table_name}] 主键迁移校验失败：实际字段={migrated_pk}，期望字段={expected_pk}")
-
+        migrated_info = con.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+        migrated_pk = [row[1] for row in migrated_info if int(row[5] or 0) > 0]
+        migration_ok = (
+            len(migrated_pk) == len(expected_pk)
+            and set(migrated_pk) == set(expected_pk)
+        )
+        if not migration_ok:
+            raise RuntimeError(
+                f"表 [{table_name}] 主键迁移校验失败："
+                f"实际={migrated_pk}，期望字段={expected_pk}"
+            )
         con.execute("COMMIT")
         con.execute("CHECKPOINT")
-        log.info(f"✅ [{table_name}] 成功重建主键: {expected_pk}")
+        removed_count = old_count - new_count
+        if removed_count > 0:
+            log.warning(
+                f"✅ 表 [{table_name}] 主键迁移完成：旧表 {old_count:,} 行，"
+                f"新表 {new_count:,} 行；已去除 {removed_count:,} 条重复键或空主键记录。"
+            )
+        else:
+            log.info(
+                f"✅ 表 [{table_name}] 主键迁移完成：已保留 {new_count:,} 行数据，"
+                f"主键字段={expected_pk}"
+            )
     except Exception:
         try:
             con.execute("ROLLBACK")
         except Exception:
             pass
-        log.exception(f"❌ 表 [{table_name}] 主键迁移失败，已回滚。")
+        log.exception(f"❌ 表 [{table_name}] 主键迁移失败，已回滚数据库事务。")
         raise
 
 def ensure_core_tables(con):
@@ -683,69 +718,14 @@ def update_qfq_view(con, as_of_date: date, window_days: int):
     """)
 
 # =========================================================
-# 多因子大盘景气度评分与波动率目标仓位
+# 多因子大盘景气度评分与选股策略
 # =========================================================
-def _compute_breadth_series(con, trade_date: date, n: int = 10) -> List[float]:
-    """近 n 个交易日的市场广度(收盘价站上MA20比例)序列，用于捕捉广度变化速率。"""
-    dates_df = con.execute("""
-        SELECT DISTINCT date FROM daily_qfq_cache
-        WHERE date <= ? ORDER BY date DESC LIMIT ?
-    """, [trade_date, n]).df()
-    if dates_df.empty:
-        return []
-    dates_sorted = sorted(pd.to_datetime(dates_df["date"]).dt.date.tolist())
-
-    breadth_vals = []
-    for d in dates_sorted:
-        row = con.execute("""
-            WITH w AS (
-                SELECT symbol, date, close,
-                       AVG(close) OVER (PARTITION BY symbol ORDER BY date
-                                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS ma20
-                FROM daily_qfq_cache
-                WHERE date <= ?
-            )
-            SELECT AVG(CASE WHEN close > ma20 THEN 1.0 ELSE 0.0 END)
-            FROM w WHERE date = ?
-        """, [d, d]).fetchone()
-        breadth_vals.append(float(row[0]) if row and row[0] is not None else 0.0)
-    return breadth_vals
-
-
-def compute_volatility_target_ratio(
-    con,
-    trade_date: date,
-    market_score: float,
-    vol_low: float = 0.08,
-    vol_high: float = 0.22,
-    ratio_floor: float = 0.15,
-    ratio_cap: float = 0.95,
-) -> float:
-    """
-    用市场评分连续映射目标年化波动率，再除以近20日指数实现波动率，
-    得到连续的目标仓位比例，替代原先 85%/50%/30% 的三档跳变。
-    """
-    target_vol_annual = vol_low + (vol_high - vol_low) * float(np.clip(market_score, 0.0, 1.0))
-
-    idx_df = con.execute("""
-        SELECT date, close FROM daily_qfq_cache
-        WHERE symbol = '000001.SH' AND date <= ?
-        ORDER BY date DESC LIMIT 21
-    """, [trade_date]).df()
-
-    if len(idx_df) < 15:
-        return 0.5
-
-    idx_df = idx_df.sort_values("date")
-    daily_ret = idx_df["close"].pct_change().dropna()
-    realized_vol_annual = float(daily_ret.std() * np.sqrt(250.0)) if len(daily_ret) > 3 else 0.0
-
-    if realized_vol_annual <= 1e-6:
-        return 0.5
-
-    raw_ratio = target_vol_annual / realized_vol_annual
-    return float(np.clip(raw_ratio, ratio_floor, ratio_cap))
-
+def get_account_state(con) -> Tuple[float, float, float]:
+    row = con.execute("SELECT init_capital, total_assets, available_cash FROM account_state WHERE id = 1").fetchone()
+    if not row:
+        cash = float(CONFIG["init_cash"])
+        return cash, cash, cash
+    return row[0], row[1], row[2]
 
 def get_market_target_position_ratio(con, trade_date: date) -> Tuple[float, str, dict]:
     start_lookback = (trade_date - timedelta(days=120)).strftime("%Y-%m-%d")
@@ -798,60 +778,21 @@ def get_market_target_position_ratio(con, trade_date: date) -> Tuple[float, str,
     else:
         T = B
 
-    # 广度动量减速项：捕捉"广度绝对水平尚可、但正在快速恶化"的早期转弱信号，
-    # 弥补原评分体系只看当日水平、反应滞后的问题。
-    try:
-        breadth_series = _compute_breadth_series(con, trade_date, n=10)
-        if len(breadth_series) >= 5:
-            x = np.arange(len(breadth_series))
-            slope = float(np.polyfit(x, breadth_series, 1)[0])
-            D = float(np.clip(0.5 + slope * 8.0, 0.0, 1.0))
-        else:
-            D = 0.5
-    except Exception:
-        D = 0.5
-
-    # 权重重新分配，加入广度动量减速 D，权重合计仍为 1
-    S = 0.30 * T + 0.25 * B + 0.15 * V + 0.15 * M + 0.15 * D
-
+    S = 0.35 * T + 0.30 * B + 0.20 * V + 0.15 * M
     details = {
         "score": round(S, 3), "pct_above_ma20": round(pct_above_ma20 * 100, 1),
         "pct_above_ma60": round(pct_above_ma60 * 100, 1),
-        "breadth_decel": round(D, 2),
     }
 
-    # 用连续的波动率目标仓位替代离散三档跳变
-    target_ratio = compute_volatility_target_ratio(con, trade_date, S)
-    details["vol_target_ratio"] = round(target_ratio * 100.0, 1)
-
     if S >= 0.65:
-        desc = f"🟢 上升行情 (S分:{S:.2f}, 波动目标仓位:{target_ratio*100:.0f}%)"
+        return float(CONFIG["bull_market_pos_ratio"]), f"🟢 上升行情 (S分:{S:.2f})", details
     elif S >= 0.45:
-        desc = f"🟡 震荡行情 (S分:{S:.2f}, 波动目标仓位:{target_ratio*100:.0f}%)"
+        return float(CONFIG["neutral_market_pos_ratio"]), f"🟡 震荡行情 (S分:{S:.2f})", details
     else:
-        desc = f"🔴 下降行情 (S分:{S:.2f}, 波动目标仓位:{target_ratio*100:.0f}%)"
+        return float(CONFIG["bear_market_pos_ratio"]), f"🔴 下降行情 (S分:{S:.2f})", details
 
-    return target_ratio, desc, details
-
-def get_account_state(con) -> Tuple[float, float, float]:
-    row = con.execute("SELECT init_capital, total_assets, available_cash FROM account_state WHERE id = 1").fetchone()
-    if not row:
-        cash = float(CONFIG["init_cash"])
-        return cash, cash, cash
-    return row[0], row[1], row[2]
-
-# =========================================================
-# 策略核心：横截面动量因子打分 + 技术形态过滤
-# =========================================================
 def compute_all_signals(con, target_date: date) -> pd.DataFrame:
-    """
-    在原有均线/MACD/EMA/BOLL硬性入场过滤基础上，新增：
-    1. 横截面动量因子打分（波动率调整动量 + 60/120日动量 + 趋势质量 + 量能强度），
-       替代"5类指标全部满足=同分"的做法，让候选股之间产生可比较的相对强弱排序。
-    2. 质量/流动性过滤：剔除当日候选池中最不稳定(高波动)与流动性最差的一批标的，
-       降低动量崩溃风险。
-    """
-    start_date = (target_date - timedelta(days=260)).strftime("%Y-%m-%d")
+    start_date = (target_date - timedelta(days=160)).strftime("%Y-%m-%d")
     end_date = target_date.strftime("%Y-%m-%d")
     atr_alpha = float(CONFIG["atr_buy_alpha"])
 
@@ -877,10 +818,7 @@ def compute_all_signals(con, target_date: date) -> pd.DataFrame:
                STDDEV(close) OVER w20 AS std20,
                AVG(volume) OVER w5 AS vol_ma5,
                AVG(amount) OVER w20 AS amount_ma20,
-               STDDEV(close / NULLIF(prev_close, 0) - 1) OVER w20 AS daily_vol20,
-               LAG(close, 20) OVER w AS close_20,
-               LAG(close, 60) OVER w AS close_60,
-               LAG(close, 120) OVER w AS close_120
+               LAG(close, 20) OVER w AS close_20
         FROM tr_data
         WINDOW
             w14 AS (PARTITION BY symbol ORDER BY date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW),
@@ -979,60 +917,10 @@ def compute_all_signals(con, target_date: date) -> pd.DataFrame:
     picks["ret_20d"] = np.where(picks["close_20"] > 0, (picks["close"] / picks["close_20"]) - 1.0, 0.0)
     picks["pct_b"] = ((picks["close"] - picks["boll_lower"]) / (picks["boll_upper"] - picks["boll_lower"])).round(3)
     picks["signal_strength"] = ((picks["dif"] / picks["close"] * 100) + (picks["volume"] / picks["vol_ma5"])).round(2)
+    picks["total_score"] = (picks["ret_20d"] * 100.0 + picks["signal_strength"]).round(2)
     picks["pattern_tag"] = np.where(picks["prev_close"] < picks["boll_mid_prev"], "🚀升穿布林中轨", "📈沿上轨攀升")
     picks["date"] = pd.to_datetime(picks["date"]).dt.date
-
-    # ---------------------------------------------------------------
-    # 质量/流动性过滤：剔除当日候选池中最不稳定与流动性最差的部分标的，
-    # 降低动量崩溃风险，而不是靠更多技术指标硬性门槛。
-    # ---------------------------------------------------------------
-    if len(picks) >= 10:
-        vol_cutoff = picks["daily_vol20"].quantile(0.85)
-        amount_cutoff = picks["amount_ma20"].quantile(0.30)
-        picks = picks[
-            (picks["daily_vol20"] <= vol_cutoff)
-            & (picks["amount_ma20"] >= amount_cutoff)
-        ].copy()
-        if picks.empty:
-            return pd.DataFrame()
-
-    # ---------------------------------------------------------------
-    # 横截面动量因子打分：波动率调整动量 + 60/120日动量 + 趋势质量 + 量能强度。
-    # 用排名(rank pct)组合，避免单一指标量纲差异主导排序。
-    # ---------------------------------------------------------------
-    picks["mom_60"] = np.where(picks["close_60"] > 0, (picks["close"] / picks["close_60"]) - 1.0, np.nan)
-    picks["mom_120"] = np.where(picks["close_120"] > 0, (picks["close"] / picks["close_120"]) - 1.0, np.nan)
-    picks["risk_adj_mom"] = picks["mom_60"] / picks["daily_vol20"].clip(lower=1e-4)
-    picks["trend_quality"] = (picks["close"] - picks["ma60"]) / picks["ma60"]
-
-    amount_mean = picks["amount_ma20"].mean()
-    amount_std = picks["amount_ma20"].std()
-    picks["amount_zscore"] = (picks["amount_ma20"] - amount_mean) / (amount_std if amount_std and amount_std > 1e-6 else 1.0)
-
-    for col in ["mom_60", "mom_120", "risk_adj_mom", "trend_quality", "amount_zscore"]:
-        picks[f"{col}_rank"] = picks[col].rank(pct=True).fillna(0.5)
-
-    picks["factor_score"] = (
-        0.30 * picks["risk_adj_mom_rank"]
-        + 0.20 * picks["mom_60_rank"]
-        + 0.15 * picks["mom_120_rank"]
-        + 0.20 * picks["trend_quality_rank"]
-        + 0.15 * picks["amount_zscore_rank"]
-    )
-
-    # 将原有的"20日涨幅+信号强度"打分与因子打分各按排名占比混合，
-    # 既保留原始信号，又引入独立的横截面强弱排序，避免单一指标主导。
-    legacy_score_raw = (picks["ret_20d"] * 100.0 + picks["signal_strength"])
-    picks["legacy_score_rank"] = legacy_score_raw.rank(pct=True)
-    picks["total_score"] = (
-        0.5 * picks["legacy_score_rank"] * 100.0
-        + 0.5 * picks["factor_score"] * 100.0
-    ).round(2)
-
-    return picks[[
-        "symbol", "date", "close", "planned_buy_price", "atr_pct", "pct_b",
-        "ret_20d", "total_score", "signal_strength", "factor_score", "pattern_tag"
-    ]]
+    return picks[["symbol", "date", "close", "planned_buy_price", "atr_pct", "pct_b", "ret_20d", "total_score", "signal_strength", "pattern_tag"]]
 
 # =========================================================
 # 交易撮合、强平再平衡与执行引擎
@@ -1079,13 +967,6 @@ def enforce_position_rebalance(con, trade_date: date, max_allowed_equity: float)
         val_reduced += gross_cash
 
 def process_exit_rules(con, trade_date: date):
-    """
-    分级离场规则：
-    - 硬性风险控制（初始ATR止损、保本止损、移动跟踪止盈、阶段硬止盈、最长持有期）
-      依旧触发全额清仓，保证尾部风险可控。
-    - 趋势结构走弱（连续两日跌破MA20 且 MA5<MA10）改为只减仓50%，
-      避免单日正常回踩被当作趋势反转清空整仓，降低误杀交易与换手率。
-    """
     holdings = con.execute("SELECT symbol, buy_date, buy_price, buy_price_hfq, shares, atr_pct_buy, highest_price_hfq FROM virtual_portfolio").df()
     if holdings.empty:
         return
@@ -1099,7 +980,6 @@ def process_exit_rules(con, trade_date: date):
     start_date = (trade_date - timedelta(days=70)).strftime('%Y-%m-%d')
     qfq_df = con.execute(f"""
         SELECT symbol, date, open, close,
-               AVG(close) OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma5,
                AVG(close) OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS ma10,
                AVG(close) OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS ma20
         FROM daily_qfq_cache
@@ -1116,13 +996,11 @@ def process_exit_rules(con, trade_date: date):
     raw_today = con.execute(f"SELECT symbol, close FROM {STOCKS_TABLE} WHERE tradedate = ?", [trade_date]).df()
     raw_map = dict(zip(raw_today["symbol"].map(canonical_symbol), raw_today["close"])) if not raw_today.empty else {}
 
-    full_exit_rows = []
-    partial_exit_rows = []
+    sold_rows = []
     sell_fee_rate = float(CONFIG["sell_fee_rate"])
     atr_stop_beta = float(CONFIG["atr_stop_loss_beta"])
     trailing_mult = float(CONFIG["trailing_stop_atr_mult"])
     target_tp = float(CONFIG["take_profit_pct"])
-    partial_exit_ratio = 0.5
 
     for _, row in holdings.iterrows():
         sym = row['symbol']
@@ -1134,19 +1012,13 @@ def process_exit_rules(con, trade_date: date):
         highest_hfq = float(row['highest_price_hfq'] or buy_price_hfq)
 
         gq = qfq_df[qfq_df['symbol'] == sym]
-        if len(gq) < 2:
+        if gq.empty:
             continue
         gh = hfq_df[hfq_df['symbol'] == sym]
-
-        last_row = gq.iloc[-1]
-        prev_row = gq.iloc[-2]
-        last_close_qfq = float(last_row['close'])
-        last_open_qfq = float(last_row['open'])
-        last_ma5 = float(last_row['ma5'])
-        last_ma10 = float(last_row['ma10'])
-        last_ma20 = float(last_row['ma20'])
-        prev_close_qfq = float(prev_row['close'])
-        prev_ma20 = float(prev_row['ma20'])
+        last_close_qfq = float(gq.iloc[-1]['close'])
+        last_open_qfq = float(gq.iloc[-1]['open'])
+        last_ma10 = float(gq.iloc[-1]['ma10'])
+        last_ma20 = float(gq.iloc[-1]['ma20'])
         last_close_hfq = float(gh.iloc[-1]['close']) if not gh.empty else last_close_qfq
 
         if last_close_hfq > highest_hfq:
@@ -1155,53 +1027,27 @@ def process_exit_rules(con, trade_date: date):
 
         curr_pnl = (last_close_hfq - buy_price_hfq) / buy_price_hfq * 100.0 if buy_price_hfq > 0 else 0.0
         peak_pnl = (highest_hfq - buy_price_hfq) / buy_price_hfq * 100.0 if buy_price_hfq > 0 else 0.0
+        reason = 0
 
-        hard_reason = 0
         if curr_pnl <= -1.0 * atr_stop_beta * atr_pct_buy * 100.0:
-            hard_reason |= REASON_STOPLOSS
+            reason |= REASON_STOPLOSS
         if peak_pnl >= 8.0 and curr_pnl <= 0.3:
-            hard_reason |= REASON_BREAKEVEN
+            reason |= REASON_BREAKEVEN
         if peak_pnl >= 12.0 and (peak_pnl - curr_pnl) >= trailing_mult * atr_pct_buy * 100.0:
-            hard_reason |= REASON_TAKE_PROFIT
+            reason |= REASON_TAKE_PROFIT
         if curr_pnl >= target_tp and last_close_qfq < last_open_qfq:
-            hard_reason |= REASON_TAKE_PROFIT
+            reason |= REASON_TAKE_PROFIT
+        if last_close_qfq < last_ma20:
+            reason |= REASON_BELOW_MA20
         if (trade_date - buy_date).days >= CONFIG['max_hold_days']:
-            hard_reason |= REASON_MAX_HOLD
+            reason |= REASON_MAX_HOLD
 
-        if hard_reason > 0:
+        if reason > 0:
             sell_price_raw = raw_map.get(sym, last_close_qfq)
-            full_exit_rows.append((sym, trade_date, last_close_qfq, shares, hard_reason, round(curr_pnl, 2), sell_price_raw))
-            continue
+            sold_rows.append((sym, trade_date, last_close_qfq, shares, reason, round(curr_pnl, 2), sell_price_raw))
 
-        # 趋势结构确认破坏：连续两日跌破MA20 且 短均线拐头，只减仓50%，
-        # 避免单日回踩被误判为趋势反转。
-        trend_broken_confirmed = (
-            last_close_qfq < last_ma20
-            and prev_close_qfq < prev_ma20
-            and last_ma5 < last_ma10
-        )
-        if trend_broken_confirmed:
-            sell_shares = int(shares * partial_exit_ratio / 100.0) * 100
-            sell_shares = max(sell_shares, 100)
-            sell_price_raw = raw_map.get(sym, last_close_qfq)
-            if sell_shares >= shares:
-                full_exit_rows.append((sym, trade_date, last_close_qfq, shares, REASON_BELOW_MA20, round(curr_pnl, 2), sell_price_raw))
-            else:
-                partial_exit_rows.append((sym, trade_date, last_close_qfq, sell_shares, REASON_BELOW_MA20, round(curr_pnl, 2), sell_price_raw))
-
-    for sym, sell_date, sell_price, shares, reason, pnl_pct, sell_price_raw in full_exit_rows:
+    for sym, sell_date, sell_price, shares, reason, pnl_pct, sell_price_raw in sold_rows:
         con.execute('DELETE FROM virtual_portfolio WHERE symbol=?', [sym])
-        gross_cash = round(shares * sell_price_raw, 2)
-        sell_fee = round(gross_cash * sell_fee_rate, 2)
-        recovered_cash = round(gross_cash - sell_fee, 2)
-        con.execute("""
-            INSERT INTO trade_history(symbol, trade_type, signal_date, trade_date, price, shares, reason, pnl_pct, fee)
-            VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
-        """, [sym, TRADE_SELL, sell_date, round(sell_price, 2), shares, reason, pnl_pct, round(sell_fee, 2)])
-        con.execute("UPDATE account_state SET available_cash = available_cash + ? WHERE id=1", [recovered_cash])
-
-    for sym, sell_date, sell_price, shares, reason, pnl_pct, sell_price_raw in partial_exit_rows:
-        con.execute('UPDATE virtual_portfolio SET shares = shares - ? WHERE symbol=?', [shares, sym])
         gross_cash = round(shares * sell_price_raw, 2)
         sell_fee = round(gross_cash * sell_fee_rate, 2)
         recovered_cash = round(gross_cash - sell_fee, 2)
@@ -1513,8 +1359,8 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
         for i, r in enumerate(df_picks.itertuples(), 1):
             sign = "+" if r.ret_20d >= 0 else ""
             cls = "ret-pos" if r.ret_20d >= 0 else "ret-neg"
-            picks_rows.append(f"<tr><td>{i}</td><td><b>{r.symbol}</b></td><td>¥{float(r.close):.2f}</td><td>¥{float(r.planned_buy_price):.2f}</td><td>{float(r.pct_b):.2f}</td><td>{float(r.factor_score):.2f}</td><td><b>{r.pattern_tag}</b></td><td class='{cls}'>{sign}{r.ret_20d*100:.1f}%</td></tr>")
-        picks_html = f"<table class='data-table'><thead><tr><th>#</th><th>代码</th><th>收盘</th><th>动态挂单价</th><th>%B位置</th><th>因子分</th><th>形态</th><th>20日涨幅</th></tr></thead><tbody>{''.join(picks_rows)}</tbody></table>"
+            picks_rows.append(f"<tr><td>{i}</td><td><b>{r.symbol}</b></td><td>¥{float(r.close):.2f}</td><td>¥{float(r.planned_buy_price):.2f}</td><td>{float(r.pct_b):.2f}</td><td><b>{r.pattern_tag}</b></td><td class='{cls}'>{sign}{r.ret_20d*100:.1f}%</td></tr>")
+        picks_html = f"<table class='data-table'><thead><tr><th>#</th><th>代码</th><th>收盘</th><th>动态挂单价</th><th>%B位置</th><th>形态</th><th>20日涨幅</th></tr></thead><tbody>{''.join(picks_rows)}</tbody></table>"
     else:
         picks_html = '<div style="text-align:center;padding:16px;color:#94a3b8;">今日无符合多头共振标的</div>'
 
@@ -1533,7 +1379,7 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
 <div class="header">
   <div>
     <h2>💴 A股多头共振策略 · {mode_title}</h2>
-    <div style="font-size:13px;opacity:0.85;margin-top:6px;">均线多头 + MA20升穿MA60 + MACD>0 + EMA多头 + BOLL沿上轨 + 横截面动量因子 + 波动率目标仓位 + 分级离场</div>
+    <div style="font-size:13px;opacity:0.85;margin-top:6px;">均线多头 + MA20升穿MA60 + MACD>0 + EMA多头 + BOLL沿上轨 + 动态再平衡</div>
   </div>
   <div style="text-align:right;">
     <div style="font-size:18px;font-weight:700;">{target_str}</div>
@@ -1557,7 +1403,7 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
     <div class="kpi-card"><div class="kpi-label">夏普 / 卡玛比率</div><div class="kpi-value">{bt_stats.get('sharpe', 0):.2f} / {bt_stats.get('calmar', 0):.2f}</div></div>
   </div>
   <div style="font-size:12px;color:#64748b;margin-top:10px;">
-    交易统计：总交易 {bt_stats.get('total_trades', 0)} 笔 | 胜率 {bt_stats.get('win_rate', 0):.1f}% | 利润因子(PF) {bt_stats.get('profit_factor', 1.0):.2f}
+    交易统计：总交易 {bt_stats.get('total_trades', 0)} 笔 | 胜率 {bt_stats.get('win_rate', 0):.1f}% | 盈亏比 {bt_stats.get('profit_factor', 1.0):.2f}
   </div>
   {chart_html}
 </div>
