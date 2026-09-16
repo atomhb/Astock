@@ -36,6 +36,10 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+# ── 启用刚刚安装的 Noto Sans CJK SC 中文字体 ──
+plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False  # 正常显示负号（-6.5%、-13.8% 等），防止负号乱码
+
 from dotenv import load_dotenv
 from tqdm import tqdm
 from requests.adapters import HTTPAdapter
@@ -968,6 +972,8 @@ def _clean_dolthub_chunk(df: pd.DataFrame) -> pd.DataFrame:
 def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
     STREAM_CHUNK_ROWS = 1000_000
     DOWNLOAD_CHUNK_KB = 10 * 1024
+    REPORT_INTERVAL_BYTES = 100 * 1024 * 1024  # 每 100 MB 报告一次
+
     url = DOLTHUB_CSV_URL
     session = build_retry_session()
 
@@ -981,6 +987,7 @@ def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
 
     total_size = int(resp.headers.get("Content-Length", 0))
     downloaded = 0
+    last_download_report = 0
     total_inserted = 0
     all_dates: set = set()
 
@@ -993,11 +1000,22 @@ def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
         dynamic_ncols=True,
     ) as pbar:
         with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as spooled:
+            # ── 1. 下载阶段：每 100 MB 输出一次下载进度 ──
             for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_KB * 1024):
                 if chunk:
                     spooled.write(chunk)
                     downloaded += len(chunk)
                     pbar.update(len(chunk))
+
+                    if downloaded - last_download_report >= REPORT_INTERVAL_BYTES:
+                        curr_mb = downloaded / 1024 / 1024
+                        if total_size > 0:
+                            tot_mb = total_size / 1024 / 1024
+                            pct = (downloaded / total_size) * 100
+                            log.info(f"⬇️ [DoltHub 流式CSV] 下载中: 已接收 {curr_mb:.1f} MB / {tot_mb:.1f} MB ({pct:.1f}%)")
+                        else:
+                            log.info(f"⬇️ [DoltHub 流式CSV] 下载中: 已接收 {curr_mb:.1f} MB")
+                        last_download_report = downloaded
 
             total_mb = downloaded / 1024 / 1024
             log.info(f"✅ [DoltHub 流式CSV] 下载完成 {total_mb:.1f} MB，开始分块解析写库 …")
@@ -1014,6 +1032,8 @@ def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
                 log.error(f"❌ [DoltHub 流式CSV] CSV 解析器初始化失败: {exc}")
                 return False, []
 
+            # ── 2. 解析写库阶段：每解析处理 100 MB 输出一次写入进度 ──
+            last_parse_report = 0
             with duckdb.connect(db_path) as con:
                 ensure_core_tables(con)
                 for i, chunk_df in enumerate(reader):
@@ -1023,8 +1043,17 @@ def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
                     all_dates.update(cleaned["tradedate"].unique())
                     ins, _, _ = _compare_and_sync_stock_rows(con, cleaned)
                     total_inserted += ins
-                    if (i + 1) % 20 == 0:
-                        log.info(f"   [DoltHub] 已处理 {(i+1)*STREAM_CHUNK_ROWS:,} 行，写入 {total_inserted:,} 条 …")
+
+                    # 利用 spooled 文件指针位置精确统计已读取的字节量
+                    curr_pos = spooled.tell()
+                    if curr_pos - last_parse_report >= REPORT_INTERVAL_BYTES:
+                        curr_mb = curr_pos / 1024 / 1024
+                        pct = (curr_pos / downloaded * 100) if downloaded > 0 else 0
+                        log.info(
+                            f"⚙️ [DoltHub 流式CSV] 解析入库中: 已处理 {curr_mb:.1f} MB / {total_mb:.1f} MB ({pct:.1f}%)，"
+                            f"累计写入 {total_inserted:,} 条 …"
+                        )
+                        last_parse_report = curr_pos
 
     all_dates_sorted = sorted(all_dates)
     log.info(
