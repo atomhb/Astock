@@ -971,8 +971,8 @@ def _clean_dolthub_chunk(df: pd.DataFrame) -> pd.DataFrame:
 
 def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
     STREAM_CHUNK_ROWS = 1000_000
-    DOWNLOAD_CHUNK_KB = 10 * 1024
-    REPORT_INTERVAL_BYTES = 100 * 1024 * 1024  # 每 100 MB 报告一次
+    DOWNLOAD_CHUNK_BYTES = 10 * 1024 * 1024       # 每次读取 10MB 网络块
+    REPORT_INTERVAL_BYTES = 100 * 1024 * 1024     # 严格每 100 MB 报告一次
 
     url = DOLTHUB_CSV_URL
     session = build_retry_session()
@@ -986,74 +986,70 @@ def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
         return False, []
 
     total_size = int(resp.headers.get("Content-Length", 0))
+    total_mb_str = f"{total_size / 1024 / 1024:.0f} MB" if total_size > 0 else "未知大小"
     downloaded = 0
     last_download_report = 0
+    t_start = time.time()
+    t_last = t_start
     total_inserted = 0
     all_dates: set = set()
 
-    with tqdm(
-        total=total_size if total_size > 0 else None,
-        unit="B",
-        unit_scale=True,
-        unit_divisor=1024,
-        desc="⬇️ DoltHub 流式CSV",
-        dynamic_ncols=True,
-    ) as pbar:
-        with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as spooled:
-            # ── 1. 下载阶段：每 100 MB 输出一次下载进度 ──
-            for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_KB * 1024):
-                if chunk:
-                    spooled.write(chunk)
-                    downloaded += len(chunk)
-                    pbar.update(len(chunk))
+    # ── 1. 下载阶段（彻底弃用 tqdm，避免非 TTY 环境狂刷千行日志）──
+    with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as spooled:
+        for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_BYTES):
+            if chunk:
+                spooled.write(chunk)
+                downloaded += len(chunk)
 
-                    if downloaded - last_download_report >= REPORT_INTERVAL_BYTES:
-                        curr_mb = downloaded / 1024 / 1024
-                        if total_size > 0:
-                            tot_mb = total_size / 1024 / 1024
-                            pct = (downloaded / total_size) * 100
-                            log.info(f"⬇️ [DoltHub 流式CSV] 下载中: 已接收 {curr_mb:.1f} MB / {tot_mb:.1f} MB ({pct:.1f}%)")
-                        else:
-                            log.info(f"⬇️ [DoltHub 流式CSV] 下载中: 已接收 {curr_mb:.1f} MB")
-                        last_download_report = downloaded
+                # 严格达到 100 MB 步长才输出一条日志
+                if downloaded - last_download_report >= REPORT_INTERVAL_BYTES:
+                    now = time.time()
+                    speed = (downloaded - last_download_report) / (now - t_last) / 1024 / 1024 if now > t_last else 0
+                    curr_mb = downloaded / 1024 / 1024
+                    pct_str = f" ({downloaded / total_size * 100:.1f}%)" if total_size > 0 else ""
+                    log.info(
+                        f"⬇️ [DoltHub 流式CSV] 下载进度: {curr_mb:.0f} MB / {total_mb_str}{pct_str} "
+                        f"| 速度: {speed:.1f} MB/s"
+                    )
+                    last_download_report = downloaded
+                    t_last = now
 
-            total_mb = downloaded / 1024 / 1024
-            log.info(f"✅ [DoltHub 流式CSV] 下载完成 {total_mb:.1f} MB，开始分块解析写库 …")
+        total_mb = downloaded / 1024 / 1024
+        log.info(f"✅ [DoltHub 流式CSV] 下载完成 共 {total_mb:.1f} MB，开始分块解析写库 …")
 
-            spooled.seek(0)
-            try:
-                reader = pd.read_csv(
-                    spooled,
-                    chunksize=STREAM_CHUNK_ROWS,
-                    low_memory=True,
-                    dtype=str,
-                )
-            except Exception as exc:
-                log.error(f"❌ [DoltHub 流式CSV] CSV 解析器初始化失败: {exc}")
-                return False, []
+        # ── 2. 解析写库阶段（同样每 100MB 报告一次入库进度）──
+        spooled.seek(0)
+        try:
+            reader = pd.read_csv(
+                spooled,
+                chunksize=STREAM_CHUNK_ROWS,
+                low_memory=True,
+                dtype=str,
+            )
+        except Exception as exc:
+            log.error(f"❌ [DoltHub 流式CSV] CSV 解析器初始化失败: {exc}")
+            return False, []
 
-            # ── 2. 解析写库阶段：每解析处理 100 MB 输出一次写入进度 ──
-            last_parse_report = 0
-            with duckdb.connect(db_path) as con:
-                ensure_core_tables(con)
-                for i, chunk_df in enumerate(reader):
-                    cleaned = _clean_dolthub_chunk(chunk_df)
-                    if cleaned.empty:
-                        continue
-                    all_dates.update(cleaned["tradedate"].unique())
-                    ins, _, _ = _compare_and_sync_stock_rows(con, cleaned)
-                    total_inserted += ins
+        last_parse_report = 0
+        with duckdb.connect(db_path) as con:
+            ensure_core_tables(con)
+            for i, chunk_df in enumerate(reader):
+                cleaned = _clean_dolthub_chunk(chunk_df)
+                if cleaned.empty:
+                    continue
+                all_dates.update(cleaned["tradedate"].unique())
+                ins, _, _ = _compare_and_sync_stock_rows(con, cleaned)
+                total_inserted += ins
 
-                    # 利用 spooled 文件指针位置精确统计已读取的字节量
-                    curr_pos = spooled.tell()
-                    if curr_pos - last_parse_report >= REPORT_INTERVAL_BYTES:
-                        curr_mb = curr_pos / 1024 / 1024
-                        pct = (curr_pos / downloaded * 100) if downloaded > 0 else 0
-                        log.info(
-                            f"⚙️ [DoltHub 流式CSV] 解析入库中: 已处理 {curr_mb:.1f} MB / {total_mb:.1f} MB ({pct:.1f}%)，"
-                            f"累计写入 {total_inserted:,} 条 …"
-                        )
-                        last_parse_report = curr_pos
+                curr_pos = spooled.tell()
+                if curr_pos - last_parse_report >= REPORT_INTERVAL_BYTES:
+                    curr_mb = curr_pos / 1024 / 1024
+                    pct = (curr_pos / downloaded * 100) if downloaded > 0 else 0
+                    log.info(
+                        f"⚙️ [DoltHub 流式CSV] 解析入库: 已处理 {curr_mb:.0f} MB / {total_mb:.0f} MB ({pct:.1f}%)，"
+                        f"累计写入 {total_inserted:,} 条数据"
+                    )
+                    last_parse_report = curr_pos
 
     all_dates_sorted = sorted(all_dates)
     log.info(
