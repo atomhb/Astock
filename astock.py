@@ -968,95 +968,115 @@ def _clean_dolthub_chunk(df: pd.DataFrame) -> pd.DataFrame:
     df = df.drop_duplicates(subset=["tradedate", "symbol"], keep="last")
     return df[["tradedate", "symbol", "high", "low", "open", "close", "adjclose", "volume", "amount"]]
 
-
 def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
     STREAM_CHUNK_ROWS = 1000_000
-    DOWNLOAD_CHUNK_BYTES = 10 * 1024 * 1024       # 每次读取 10MB 网络块
+    DOWNLOAD_CHUNK_BYTES = 2 * 1024 * 1024        # 2MB 网络缓冲，防止大块传输超时
     REPORT_INTERVAL_BYTES = 100 * 1024 * 1024     # 严格每 100 MB 报告一次
+    MIN_EXPECTED_BYTES = int(1.15 * 1024 * 1024 * 1024)  # 完整文件为 1.24 GB，设置 1.15 GB 完整性底线
+    MAX_RETRIES = 3
 
     url = DOLTHUB_CSV_URL
     session = build_retry_session()
 
-    log.info(f"⬇️ [DoltHub 流式CSV] 开始下载并写库: {url}")
-    try:
-        resp = session.get(url, stream=True, timeout=(15, 600))
-        resp.raise_for_status()
-    except Exception as exc:
-        log.error(f"❌ [DoltHub 流式CSV] 请求失败: {exc}")
-        return False, []
-
-    total_size = int(resp.headers.get("Content-Length", 0))
-    total_mb_str = f"{total_size / 1024 / 1024:.0f} MB" if total_size > 0 else "未知大小"
-    downloaded = 0
-    last_download_report = 0
-    t_start = time.time()
-    t_last = t_start
-    total_inserted = 0
-    all_dates: set = set()
-
-    # ── 1. 下载阶段（彻底弃用 tqdm，避免非 TTY 环境狂刷千行日志）──
-    with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as spooled:
-        for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_BYTES):
-            if chunk:
-                spooled.write(chunk)
-                downloaded += len(chunk)
-
-                # 严格达到 100 MB 步长才输出一条日志
-                if downloaded - last_download_report >= REPORT_INTERVAL_BYTES:
-                    now = time.time()
-                    speed = (downloaded - last_download_report) / (now - t_last) / 1024 / 1024 if now > t_last else 0
-                    curr_mb = downloaded / 1024 / 1024
-                    pct_str = f" ({downloaded / total_size * 100:.1f}%)" if total_size > 0 else ""
-                    log.info(
-                        f"⬇️ [DoltHub 流式CSV] 下载进度: {curr_mb:.0f} MB / {total_mb_str}{pct_str} "
-                        f"| 速度: {speed:.1f} MB/s"
-                    )
-                    last_download_report = downloaded
-                    t_last = now
-
-        total_mb = downloaded / 1024 / 1024
-        log.info(f"✅ [DoltHub 流式CSV] 下载完成 共 {total_mb:.1f} MB，开始分块解析写库 …")
-
-        # ── 2. 解析写库阶段（同样每 100MB 报告一次入库进度）──
-        spooled.seek(0)
+    for attempt in range(1, MAX_RETRIES + 1):
+        log.info(f"⬇️ [DoltHub 流式CSV] 开始下载并写库 (第 {attempt}/{MAX_RETRIES} 次尝试): {url}")
         try:
-            reader = pd.read_csv(
-                spooled,
-                chunksize=STREAM_CHUNK_ROWS,
-                low_memory=True,
-                dtype=str,
-            )
+            resp = session.get(url, stream=True, timeout=(30, 900))
+            resp.raise_for_status()
         except Exception as exc:
-            log.error(f"❌ [DoltHub 流式CSV] CSV 解析器初始化失败: {exc}")
+            log.error(f"❌ [DoltHub 流式CSV] 连接建立失败: {exc}")
+            if attempt < MAX_RETRIES:
+                time.sleep(5)
+                continue
             return False, []
 
-        last_parse_report = 0
-        with duckdb.connect(db_path) as con:
-            ensure_core_tables(con)
-            for i, chunk_df in enumerate(reader):
-                cleaned = _clean_dolthub_chunk(chunk_df)
-                if cleaned.empty:
+        downloaded = 0
+        last_download_report = 0
+        t_start = time.time()
+        t_last = t_start
+        total_inserted = 0
+        all_dates: set = set()
+
+        with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as spooled:
+            # ── 1. 下载阶段 ──
+            try:
+                for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_BYTES):
+                    if chunk:
+                        spooled.write(chunk)
+                        downloaded += len(chunk)
+
+                        if downloaded - last_download_report >= REPORT_INTERVAL_BYTES:
+                            now = time.time()
+                            speed = (downloaded - last_download_report) / (now - t_last) / 1024 / 1024 if now > t_last else 0
+                            curr_mb = downloaded / 1024 / 1024
+                            log.info(
+                                f"⬇️ [DoltHub 流式CSV] 下载进度: {curr_mb:.0f} MB / 约 1.24 GB "
+                                f"({curr_mb / 1269 * 100:.1f}%) | 速度: {speed:.1f} MB/s"
+                            )
+                            last_download_report = downloaded
+                            t_last = now
+            except Exception as stream_exc:
+                log.warning(f"⚠️ [DoltHub 流式CSV] 网络读取发生异常: {stream_exc}")
+
+            curr_mb = downloaded / 1024 / 1024
+
+            # ── 2. 完整性校验：拦截 750MB 之类的中途断线 ──
+            if downloaded < MIN_EXPECTED_BYTES:
+                log.warning(
+                    f"⚠️ [DoltHub 流式CSV] 数据不完整！仅接收 {curr_mb:.1f} MB < 预期 1.24 GB "
+                    f"(连接在传输中途断开)，正在自动重新下载..."
+                )
+                if attempt < MAX_RETRIES:
+                    time.sleep(5)
                     continue
-                all_dates.update(cleaned["tradedate"].unique())
-                ins, _, _ = _compare_and_sync_stock_rows(con, cleaned)
-                total_inserted += ins
+                else:
+                    log.error("❌ [DoltHub 流式CSV] 达到最大重试次数，无法获取完整文件")
+                    return False, []
 
-                curr_pos = spooled.tell()
-                if curr_pos - last_parse_report >= REPORT_INTERVAL_BYTES:
-                    curr_mb = curr_pos / 1024 / 1024
-                    pct = (curr_pos / downloaded * 100) if downloaded > 0 else 0
-                    log.info(
-                        f"⚙️ [DoltHub 流式CSV] 解析入库: 已处理 {curr_mb:.0f} MB / {total_mb:.0f} MB ({pct:.1f}%)，"
-                        f"累计写入 {total_inserted:,} 条数据"
-                    )
-                    last_parse_report = curr_pos
+            log.info(f"✅ [DoltHub 流式CSV] 完整下载校验通过！共 {curr_mb:.1f} MB，开始分块解析写库 …")
 
-    all_dates_sorted = sorted(all_dates)
-    log.info(
-        f"✅ [DoltHub 流式CSV] 写库完成: 共写入 {total_inserted:,} 条，"
-        f"覆盖 {len(all_dates_sorted)} 个交易日"
-    )
-    return total_inserted > 0, all_dates_sorted
+            # ── 3. 分块解析写库 ──
+            spooled.seek(0)
+            try:
+                reader = pd.read_csv(
+                    spooled,
+                    chunksize=STREAM_CHUNK_ROWS,
+                    low_memory=True,
+                    dtype=str,
+                )
+            except Exception as exc:
+                log.error(f"❌ [DoltHub 流式CSV] CSV 解析器初始化失败: {exc}")
+                return False, []
+
+            last_parse_report = 0
+            with duckdb.connect(db_path) as con:
+                ensure_core_tables(con)
+                for i, chunk_df in enumerate(reader):
+                    cleaned = _clean_dolthub_chunk(chunk_df)
+                    if cleaned.empty:
+                        continue
+                    all_dates.update(cleaned["tradedate"].unique())
+                    ins, _, _ = _compare_and_sync_stock_rows(con, cleaned)
+                    total_inserted += ins
+
+                    curr_pos = spooled.tell()
+                    if curr_pos - last_parse_report >= REPORT_INTERVAL_BYTES:
+                        c_mb = curr_pos / 1024 / 1024
+                        pct = (curr_pos / downloaded * 100) if downloaded > 0 else 0
+                        log.info(
+                            f"⚙️ [DoltHub 流式CSV] 解析入库: 已处理 {c_mb:.0f} MB / {curr_mb:.0f} MB ({pct:.1f}%)，"
+                            f"累计写入 {total_inserted:,} 条数据"
+                        )
+                        last_parse_report = curr_pos
+
+            all_dates_sorted = sorted(all_dates)
+            log.info(
+                f"✅ [DoltHub 流式CSV] 写库完成: 共写入 {total_inserted:,} 条，"
+                f"覆盖 {len(all_dates_sorted)} 个交易日，最新交易日: {all_dates_sorted[-1] if all_dates_sorted else '无'}"
+            )
+            return total_inserted > 0, all_dates_sorted
+
+    return False, []
 
 
 def dolthub_sync_recent_window(db_path: str, target_date: date, trade_days: int) -> Tuple[bool, List[date]]:
