@@ -3,7 +3,7 @@
 """
 1. 行情数据统一落到 stocks 表，使用 investment_data 最新发布包。
 2. 价格与金额直接使用人民币浮点值，不再做旧版整数缩放。
-3. 每日数据源只依赖 chenditc/investment_data（Qlib）。
+3. 每日数据源只依赖 chenditc/investment_data（Qlib）与 DoltHub。
 4. 前复权和后复权基于 stocks 表中的 close / adjclose 动态构建。
 5. 策略和报表直接读取 stocks / qfq / hfq 结果表。
 6. 选股信号使用前复权数据；收益率和止盈止损收益判断使用后复权数据。
@@ -36,14 +36,15 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-# ── 启用刚刚安装的 Noto Sans CJK SC 中文字体 ──
-plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'SimHei', 'DejaVu Sans']
-plt.rcParams['axes.unicode_minus'] = False  # 正常显示负号（-6.5%、-13.8% 等），防止负号乱码
-
 from dotenv import load_dotenv
 from tqdm import tqdm
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# ── 启用中文字体链（兼容 Linux/GitHub Actions runner 与本地环境，负号防乱码）──
+plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
 try:
     import talib
 except Exception:
@@ -81,11 +82,11 @@ def _env(key: str, default: str = "") -> str:
 
 
 CONFIG = {
-    # 仅以下 3 个参数来自普通环境变量
+    # 环境变量配置
     "azure_client_id": _env("AZURE_CLIENT_ID"),
     "token_cache_file": os.path.join(BASE_DIR, _env("TOKEN_CACHE_FILE", "ms_token.json")),
     "email_to": _env("EMAIL_TO"),
-    # 其余参数固定在程序内部，避免运行环境过多配置项
+    # 程序核心参数
     "onedrive_folder": "Stock",
     "cloud_db_gz_name": "Tu_A_stock.duckdb.gz",
     "local_db_gz_dir": None,
@@ -103,8 +104,8 @@ CONFIG = {
     "buy_fee_rate": 0.0005,
     "sell_fee_rate": 0.0010,
 
-    # ── 1. 动态 ATR (14) 参数配置 ──
-    "atr_period": 14,                      # ATR 算周期
+    # ── 动态 ATR (14) 参数配置 ──
+    "atr_period": 14,                      # ATR 计算周期
     "atr_buy_alpha": 0.5,                  # 挂单价系数：挂单价 = T日收盘价 - 0.5 * ATR(14)
     "atr_stop_loss_beta": 2.0,             # 动态止损系数：止损触发点 = -2.0 * ATR_pct
 
@@ -949,6 +950,46 @@ def investment_data_sync_full_history(db_path: str, target_date: date) -> Tuple[
     return inserted + updated > 0 or skipped > 0, all_dates
 
 
+def investment_data_sync_gap(db_path: str, start_date: date, target_date: date) -> Tuple[bool, List[date]]:
+    """使用 Qlib 将 start_date 至 target_date 之间的历史断层分年补齐"""
+    provider_uri = prepare_latest_qlib_data()
+    ensure_qlib_initialized(provider_uri)
+
+    all_dates: List[date] = []
+    inserted = updated = skipped = 0
+    chunk_start = start_date
+
+    while chunk_start <= target_date:
+        chunk_end = min(target_date, date(chunk_start.year + 1, 1, 1) - timedelta(days=1))
+        log.info(f"📦 [补齐数据断层] 正在拉取并写库: {chunk_start} ~ {chunk_end} …")
+        chunk_df = fetch_qlib_features(chunk_start, chunk_end)
+        if not chunk_df.empty:
+            chunk_df = chunk_df[
+                (chunk_df["tradedate"] >= chunk_start)
+                & (chunk_df["tradedate"] <= chunk_end)
+            ].copy()
+            if not chunk_df.empty:
+                dates = sorted(pd.to_datetime(chunk_df["tradedate"]).dt.date.unique().tolist())
+                all_dates.extend(dates)
+                with duckdb.connect(db_path) as con:
+                    ensure_core_tables(con)
+                    ins, upd, skip = _compare_and_sync_stock_rows(con, chunk_df)
+                inserted += ins
+                updated += upd
+                skipped += skip
+        chunk_start = date(chunk_end.year + 1, 1, 1)
+
+    all_dates = sorted(set(all_dates))
+    log.info(
+        f"✅ [补齐数据断层] 完成: 累计补入 {inserted + updated:,} 条，"
+        f"覆盖 {len(all_dates)} 个交易日，数据库最新交易日已成功拉平至 {all_dates[-1] if all_dates else target_date}"
+    )
+    return (inserted + updated) > 0 or skipped > 0, all_dates
+
+
+# =========================================================
+# DoltHub CSV 数据源（带 1.24GB 完整性硬校验与 100MB 报告）
+# =========================================================
 def _clean_dolthub_chunk(df: pd.DataFrame) -> pd.DataFrame:
     required = ["tradedate", "symbol", "high", "low", "open", "close"]
     if any(c not in df.columns for c in required):
@@ -968,9 +1009,10 @@ def _clean_dolthub_chunk(df: pd.DataFrame) -> pd.DataFrame:
     df = df.drop_duplicates(subset=["tradedate", "symbol"], keep="last")
     return df[["tradedate", "symbol", "high", "low", "open", "close", "adjclose", "volume", "amount"]]
 
+
 def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
     STREAM_CHUNK_ROWS = 1000_000
-    DOWNLOAD_CHUNK_BYTES = 2 * 1024 * 1024        # 2MB 网络缓冲，防止大块传输超时
+    DOWNLOAD_CHUNK_BYTES = 2 * 1024 * 1024        # 2MB 网络缓冲
     REPORT_INTERVAL_BYTES = 100 * 1024 * 1024     # 严格每 100 MB 报告一次
     MIN_EXPECTED_BYTES = int(1.15 * 1024 * 1024 * 1024)  # 完整文件为 1.24 GB，设置 1.15 GB 完整性底线
     MAX_RETRIES = 3
@@ -998,7 +1040,7 @@ def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
         all_dates: set = set()
 
         with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as spooled:
-            # ── 1. 下载阶段 ──
+            # ── 1. 下载阶段（彻底弃用 tqdm 刷屏，按 100MB 步进汇报）──
             try:
                 for chunk in resp.iter_content(chunk_size=DOWNLOAD_CHUNK_BYTES):
                     if chunk:
@@ -1016,26 +1058,26 @@ def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
                             last_download_report = downloaded
                             t_last = now
             except Exception as stream_exc:
-                log.warning(f"⚠️ [DoltHub 流式CSV] 网络读取发生异常: {stream_exc}")
+                log.warning(f"⚠️ [DoltHub 流式CSV] 网络读取异常: {stream_exc}")
 
             curr_mb = downloaded / 1024 / 1024
 
-            # ── 2. 完整性校验：拦截 750MB 之类的中途断线 ──
+            # ── 2. 完整性校验：拦截中途断线 ──
             if downloaded < MIN_EXPECTED_BYTES:
                 log.warning(
                     f"⚠️ [DoltHub 流式CSV] 数据不完整！仅接收 {curr_mb:.1f} MB < 预期 1.24 GB "
-                    f"(连接在传输中途断开)，正在自动重新下载..."
+                    f"(远端连接中途意外关闭)，正在自动重新下载..."
                 )
                 if attempt < MAX_RETRIES:
                     time.sleep(5)
                     continue
                 else:
-                    log.error("❌ [DoltHub 流式CSV] 达到最大重试次数，无法获取完整文件")
+                    log.error("❌ [DoltHub 流式CSV] 达到最大重试次数，未能下载完整文件")
                     return False, []
 
             log.info(f"✅ [DoltHub 流式CSV] 完整下载校验通过！共 {curr_mb:.1f} MB，开始分块解析写库 …")
 
-            # ── 3. 分块解析写库 ──
+            # ── 3. 分块解析写库（每处理 100MB 报告一次）──
             spooled.seek(0)
             try:
                 reader = pd.read_csv(
@@ -1242,7 +1284,7 @@ def detect_kline_patterns(open_s, high_s, low_s, close_s) -> Tuple[str, float, s
     return bull_text, min(len(bull_patterns), 5.0), bear_text, min(len(bear_patterns), 5.0)
 
 
-# ── 3. 大盘环境多级仓位管理 (Regime Switching) ──
+# ── 大盘环境多级仓位管理 (Regime Switching) ──
 def get_market_target_position_ratio(con, trade_date: date, index_symbol="000001.SH") -> float:
     if not CONFIG.get("market_health_check", True):
         return 1.0
@@ -1866,7 +1908,7 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
                 annual_ret = (1 + total_ret) ** (252 / max(n_days, 1)) - 1.0
                 calmar = annual_ret / max_drawdown if max_drawdown > 0 else 0.0
 
-                # ── 绘制净值与回撤双子图（高品质渲染） ──
+                # ── 绘制专业净值与回撤双子图 ──
                 plt.close('all')
                 fig, (ax1, ax2) = plt.subplots(
                     2, 1, figsize=(11, 6.2), sharex=True,
@@ -1906,7 +1948,7 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
             except Exception as e:
                 log.error(f"Plotting failed: {e}")
 
-        # ── 历史交易表现统计 ──
+        # ── 历史交易表现统计（总交易笔数、胜率、盈亏比）──
         trade_stats_row = con.execute("""
             SELECT 
                 COUNT(*) AS total_sells,
@@ -1946,10 +1988,195 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
             "win_rate": win_rate,
             "profit_loss_ratio": profit_loss_ratio,
             "chart_b64": chart_b64,
+            "hist_df": hist_df,  # 传递历史数据用于构建交互式图表
         }
         df_trades = con.execute("SELECT * FROM trade_history WHERE trade_date = ? ORDER BY trade_type, symbol", [target_date]).df()
         apply_history_retention(con)
     return decode_numeric_frame(df_picks), decode_numeric_frame(df_portfolio), decode_numeric_frame(df_pending), decode_numeric_frame(df_trades), metrics
+
+# =========================================================
+# 交互式图表生成器 (ECharts Standalone HTML)
+# =========================================================
+def build_interactive_chart_html(hist_df: pd.DataFrame, metrics: dict, target_str: str) -> str:
+    """生成无需额外 Python 依赖的 ECharts 独立交互式 HTML 回测图表"""
+    if hist_df is None or len(hist_df) < 2:
+        return ""
+
+    init_cap = float(CONFIG.get("init_cash", 100000.0))
+    dates = [pd.to_datetime(d).strftime('%Y-%m-%d') for d in hist_df['date']]
+    net_values = [round(float(v), 4) for v in (hist_df['total_assets'] / init_cap)]
+    peaks = np.maximum.accumulate(net_values)
+    drawdowns = [round(float(-(p - v) / p * 100), 2) if p > 0 else 0.0 for p, v in zip(peaks, net_values)]
+
+    dates_json = json.dumps(dates)
+    net_values_json = json.dumps(net_values)
+    drawdowns_json = json.dumps(drawdowns)
+
+    sharpe = metrics.get('sharpe', 0.0)
+    total_ret = metrics.get('total_pnl_pct', 0.0)
+    annual_ret = metrics.get('annual_ret', 0.0) * 100.0
+    max_dd = metrics.get('max_drawdown', 0.0) * 100.0
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>A股多头共振策略 - 交互式回测图表 ({target_str})</title>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+  <style>
+    body {{ margin:0; padding:16px; background:#121418; color:#f1f5f9; font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; }}
+    .header {{ text-align:center; margin-bottom:16px; }}
+    .header h2 {{ font-size:20px; margin:0 0 6px 0; color:#fff; }}
+    .header p {{ font-size:13px; color:#94a3b8; margin:0; }}
+    #main {{ width:100%; height:82vh; background:#1a1e24; border-radius:12px; border:1px solid #282f3c; box-shadow:0 6px 20px rgba(0,0,0,0.4); }}
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h2>📈 A股多头共振策略 · 交互式回测图表</h2>
+    <p>统计区间: {dates[0]} ~ {dates[-1]} | 累计收益: {total_ret:+.1f}% | 年化: {annual_ret:+.1f}% | 最大回撤: -{max_dd:.1f}% | 夏普比率: {sharpe:.2f}</p>
+  </div>
+  <div id="main"></div>
+
+  <script>
+    var chartDom = document.getElementById('main');
+    var myChart = echarts.init(chartDom, 'dark');
+    var dates = {dates_json};
+    var netValues = {net_values_json};
+    var drawdowns = {drawdowns_json};
+
+    var option = {{
+      backgroundColor: '#1a1e24',
+      animation: true,
+      tooltip: {{
+        trigger: 'axis',
+        axisPointer: {{ type: 'cross', lineStyle: {{ color: '#94a3b8', type: 'dashed' }} }},
+        backgroundColor: 'rgba(24, 27, 34, 0.95)',
+        borderColor: '#3b82f6',
+        borderWidth: 1,
+        textStyle: {{ color: '#f8fafc', fontSize: 13 }},
+        formatter: function(params) {{
+          var res = '<div style="font-weight:bold;margin-bottom:4px;">' + params[0].axisValue + '</div>';
+          params.forEach(function(item) {{
+            if (item.seriesName === '策略净值') {{
+              res += '<span style="color:#3b82f6">●</span> 净值: <b>' + item.data + '</b><br/>';
+            }} else if (item.seriesName === '动态回撤') {{
+              res += '<span style="color:#ef4444">●</span> 回撤: <b>' + item.data + '%</b>';
+            }}
+          }});
+          return res;
+        }}
+      }},
+      legend: {{
+        data: ['策略净值', '动态回撤'],
+        top: 10,
+        textStyle: {{ color: '#cbd5e1' }}
+      }},
+      toolbox: {{
+        right: 20,
+        top: 10,
+        feature: {{
+          dataZoom: {{ yAxisIndex: 'none' }},
+          restore: {{}},
+          saveAsImage: {{ title: '保存图片', pixelRatio: 2 }}
+        }},
+        iconStyle: {{ borderColor: '#94a3b8' }}
+      }},
+      axisPointer: {{ link: [{{ xAxisIndex: 'all' }}] }},
+      grid: [
+        {{ left: '55px', right: '30px', top: '12%', height: '54%' }},
+        {{ left: '55px', right: '30px', top: '72%', height: '18%' }}
+      ],
+      xAxis: [
+        {{
+          type: 'category',
+          data: dates,
+          scale: true,
+          boundaryGap: false,
+          axisLine: {{ lineStyle: {{ color: '#475569' }} }},
+          splitLine: {{ show: true, lineStyle: {{ color: '#252b36', type: 'dashed' }} }},
+          axisLabel: {{ show: false }}
+        }},
+        {{
+          type: 'category',
+          gridIndex: 1,
+          data: dates,
+          boundaryGap: false,
+          axisLine: {{ lineStyle: {{ color: '#475569' }} }},
+          splitLine: {{ show: true, lineStyle: {{ color: '#252b36', type: 'dashed' }} }},
+          axisLabel: {{ color: '#94a3b8' }}
+        }}
+      ],
+      yAxis: [
+        {{
+          scale: true,
+          splitArea: {{ show: false }},
+          axisLine: {{ lineStyle: {{ color: '#475569' }} }},
+          splitLine: {{ lineStyle: {{ color: '#252b36', type: 'dashed' }} }},
+          axisLabel: {{ color: '#94a3b8' }}
+        }},
+        {{
+          gridIndex: 1,
+          scale: true,
+          splitArea: {{ show: false }},
+          axisLine: {{ lineStyle: {{ color: '#475569' }} }},
+          splitLine: {{ lineStyle: {{ color: '#252b36', type: 'dashed' }} }},
+          axisLabel: {{
+            color: '#94a3b8',
+            formatter: '{{value}}%'
+          }}
+        }}
+      ],
+      dataZoom: [
+        {{ type: 'inside', xAxisIndex: [0, 1] }},
+        {{
+          type: 'slider',
+          xAxisIndex: [0, 1],
+          bottom: 10,
+          height: 20,
+          borderColor: '#2d3748',
+          textStyle: {{ color: '#94a3b8' }}
+        }}
+      ],
+      series: [
+        {{
+          name: '策略净值',
+          type: 'line',
+          data: netValues,
+          smooth: true,
+          showSymbol: false,
+          lineStyle: {{ width: 2.5, color: '#3b82f6' }},
+          markLine: {{
+            silent: true,
+            symbol: 'none',
+            lineStyle: {{ color: '#94a3b8', type: 'dashed' }},
+            data: [{{ yAxis: 1.0 }}]
+          }}
+        }},
+        {{
+          name: '动态回撤',
+          type: 'line',
+          xAxisIndex: 1,
+          yAxisIndex: 1,
+          data: drawdowns,
+          smooth: true,
+          showSymbol: false,
+          lineStyle: {{ width: 1, color: '#ef4444' }},
+          areaStyle: {{
+            color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+              {{ offset: 0, color: 'rgba(239, 68, 68, 0.4)' }},
+              {{ offset: 1, color: 'rgba(239, 68, 68, 0.05)' }}
+            ])
+          }}
+        }}
+      ]
+    }};
+    myChart.setOption(option);
+    window.addEventListener('resize', function() {{ myChart.resize(); }});
+  </script>
+</body>
+</html>"""
+    return html_content
 
 # =========================================================
 # 报告邮件
@@ -2152,7 +2379,7 @@ def generate_and_send_report(
     pos_limit_pct = pos_limit_ratio * 100.0
 
     if pos_limit_ratio >= 1.0:
-        regime_badge = f'🟢 上升行情 (满仓上限)'
+        regime_badge = '🟢 上升行情 (满仓上限)'
     elif pos_limit_ratio >= 0.5:
         regime_badge = f'🟡 震荡行情 (受控上限: {pos_limit_pct:.0f}%)'
     else:
@@ -2305,8 +2532,17 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
   交易统计：总交易 {metrics.get('total_trades', 0)} 笔 | 胜率 {metrics.get('win_rate', 0):.1f}% | 盈亏比 {metrics.get('profit_loss_ratio', 0):.2f}
 </div>
 
-<!-- 绩效曲线（Matplotlib 渲染） -->
-{f'<div class="chart-container"><img class="chart-img" src="data:image/png;base64,{metrics.get("chart_b64")}" alt="回测净值曲线" /></div>' if metrics.get("chart_b64") else ''}
+<!-- 绩效曲线（Matplotlib 静态预览 + 交互图引导） -->
+{f'''
+<div class="chart-container">
+  <img class="chart-img" src="data:image/png;base64,{metrics.get("chart_b64")}" alt="回测净值曲线" />
+  <div style="margin-top:12px;text-align:center;">
+    <span style="display:inline-block;background:#1e293b;border:1px solid #3b82f6;border-radius:20px;padding:6px 14px;font-size:12px;color:#60a5fa;">
+      ✨ 已随邮件附带 <b>交互式动态图表.html</b>，点击附件即可开启十字光标追踪与滚轮局部缩放！
+    </span>
+  </div>
+</div>
+''' if metrics.get("chart_b64") else ''}
 
 <!-- 1. 当前持仓 -->
 <div class="section-card">
@@ -2371,6 +2607,21 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
 </div></body></html>"""
 
     attachments = []
+    
+    # ── 1. 自动挂载独立交互式 HTML 回测图表 ──
+    hist_df = metrics.get("hist_df")
+    if hist_df is not None and not hist_df.empty:
+        interactive_html = build_interactive_chart_html(hist_df, metrics, target_str)
+        if interactive_html:
+            interactive_b64 = base64.b64encode(interactive_html.encode('utf-8')).decode('utf-8')
+            attachments.append({
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": f"A股多头共振策略_交互式回测图表_{target_str}.html",
+                "contentBytes": interactive_b64,
+                "contentType": "text/html"
+            })
+
+    # ── 2. 挂载日志文件 ──
     if os.path.exists(LOG_FILE):
         with open(LOG_FILE, "rb") as f:
             content_bytes = base64.b64encode(f.read()).decode("utf-8")
@@ -2379,6 +2630,7 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
             "name": os.path.basename(LOG_FILE),
             "contentBytes": content_bytes,
         })
+
     send_email_via_graph(tm, f"💴 CN量化日报 - {target_str}", html, attachments)
 
 # =========================================================
@@ -2391,7 +2643,7 @@ def _latest_trade_date_in_db(con, target_date: date) -> Optional[date]:
     return pd.to_datetime(row[0]).date()
 
 
-ASTOCK_VERSION = "fixed-v3-dashboard-pro"
+ASTOCK_VERSION = "fixed-v3-pro-dashboard"
 
 
 def self_check(db_path: str, target_date: date) -> None:
@@ -2469,7 +2721,7 @@ def run_daily_pipeline():
             load_db_gz_to_local(gz_path, db_path)
             log.info("✅ 已载入历史数据库（gz 解压完成）")
         else:
-            log.info("ℹ️ 本地/OneDrive 均无历史数据库，执行全量初始化")
+            log.info("ℹ️ 本地/OneDrive 均无历史数据库，准备全量初始化")
             initialize_empty_database(db_path)
 
         with duckdb.connect(db_path) as con:
@@ -2477,38 +2729,45 @@ def run_daily_pipeline():
             ensure_core_tables(con)
             ensure_strategy_tables(con)
             latest_before = _latest_trade_date_in_db(con, target_date)
-            earliest_before = con.execute(
-                f"SELECT MIN(tradedate) FROM {STOCKS_TABLE}"
-            ).fetchone()[0]
-            log.info(f"ℹ️ 更新前数据库最新交易日: {latest_before}")
-            log.info(f"ℹ️ 更新前数据库最早交易日: {earliest_before}")
+            log.info(f"ℹ️ 当前库内已有最新交易日: {latest_before}")
 
         _trade_days = int(CONFIG["update_window_trade_days"])
-        log.info("📦 [优先] 尝试从 Qlib tar.gz 拉取行情数据 …")
+        log.info("📦 开始同步与校验行情数据完整性 …")
+
+        # ── 步骤 1：若无数据库，拉取 DoltHub 1.24G 全量数据（带 1.15G 底线完整校验与 100MB 汇报）──
+        if not db_gz_ready:
+            log.info("📚 未发现数据库：使用 DoltHub ts_a_stock_eod_price 拉取全量历史数据 …")
+            try:
+                dolthub_stream_to_db(db_path)
+            except Exception as e:
+                log.warning(f"⚠️ DoltHub 拉取异常: {e}")
+
+        # ── 步骤 2：二次核实库中实际最新交易日 ──
+        with duckdb.connect(db_path) as con:
+            latest_in_db = _latest_trade_date_in_db(con, target_date)
+            log.info(f"ℹ️ 核验库内最新交易日: {latest_in_db}")
+
+        # ── 步骤 3：根据断层状态，智能通过 Qlib 补平至 2026 当下 ──
+        synced = False
         try:
-            needs_full_history = not db_gz_ready
-            if needs_full_history:
-                log.info("📚 未发现数据库：使用 DoltHub ts_a_stock_eod_price 从1990-12-19建立全量A股数据库")
-                synced, _ = dolthub_stream_to_db(db_path)
+            if latest_in_db is None:
+                log.info("📦 库内无数据，使用 Qlib 进行全历史初始化 …")
+                synced, _ = investment_data_sync_full_history(db_path, target_date)
+            elif (target_date - latest_in_db).days > 30:
+                # 若存在截断或跨年断层，自动使用 Qlib 逐年增量拼接补齐
+                gap_start = latest_in_db + timedelta(days=1)
+                log.info(f"🚀 检测到数据断层 ({latest_in_db} ➔ {target_date})，启动 Qlib 增量追齐 …")
+                synced, _ = investment_data_sync_gap(db_path, gap_start, target_date)
             else:
-                log.info(f"🔄 已有历史数据库，仅增量更新最近 {_trade_days} 个交易日")
+                # 仅差几天，日常窗口增量同步即可
+                log.info(f"🔄 库内数据健康，增量同步最近 {_trade_days} 个交易日 …")
                 synced, _ = investment_data_sync_recent_window(db_path, target_date, _trade_days)
         except Exception as _qlib_exc:
-            log.warning(f"⚠️ Qlib 拉取异常: {_qlib_exc}")
+            log.warning(f"⚠️ Qlib 增量同步异常: {_qlib_exc}")
             synced = False
-        if not synced:
-            log.info("📦 [降级] 尝试从 DoltHub CSV 拉取行情数据 …")
-            try:
-                if needs_full_history:
-                    log.info("📚 DoltHub ts_a_stock_eod_price 全量初始化失败，尝试 Qlib 全历史作为备用方案")
-                    synced, _ = investment_data_sync_full_history(db_path, target_date)
-                else:
-                    synced, _ = dolthub_sync_recent_window(db_path, target_date, _trade_days)
-            except Exception as _dolt_exc:
-                log.warning(f"⚠️ DoltHub 拉取异常: {_dolt_exc}")
-                synced = False
-        if not synced:
-            log.error("❌ 行情数据同步失败，终止流程")
+
+        if not synced and latest_in_db is None:
+            log.error("❌ 行情数据同步失败且库内无可用数据，终止流程")
             return None, None
 
         self_check(db_path, target_date)
