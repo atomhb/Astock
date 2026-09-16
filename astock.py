@@ -108,13 +108,11 @@ CONFIG = {
     "buy_confirm_vol_ratio_min": 0.5,      # (保留参数) T+1相对量比下限
     "buy_confirm_ma20_margin": 0.99,       # (保留参数) 允许跌破MA20的容差
     "buy_signal_expire_days": 2,           # 挂单最长有效天数（按交易日计）
-    "buy_confirm_checks": False,           # 是否在挂单成交时附加质量确认(量比/MA20/MACD)。
-                                           # 默认 False：最低价触达挂单价即成交；
-                                           # 若 True，触价后还需通过确认，否则大概率“触价不成交”
+    "buy_confirm_checks": False,           # 是否在挂单成交时附加质量确认
     "market_health_check": True,           # 是否启用大盘过滤
-    "filter_gem_star": False,               # 是否过滤创业板/科创板
+    "filter_gem_star": False,              # 是否过滤创业板/科创板
     "init_cash": 100000.0,                 # 初始资金参数
-    "max_position_stocks": 5,             # 持仓中最多有的股票数
+    "max_position_stocks": 5,              # 持仓中最多有的股票数
 }
 
 CONFIG["position_cash_cent"] = int(round(CONFIG["position_cash_yuan"] * 100))
@@ -392,7 +390,6 @@ class OneDriveClient:
                     chunk = f.read(CHUNK_SIZE)
                     end = offset + len(chunk) - 1
 
-                    # ── 分块上传指数退避重试逻辑 ──
                     max_retries = 5
                     for attempt in range(1, max_retries + 1):
                         try:
@@ -492,7 +489,6 @@ def ensure_core_tables(con):
             PRIMARY KEY (symbol, tradedate)
         )
     """)
-    # Backfill factors for databases created before adjustment_factors existed.
     con.execute(f"""
         INSERT OR IGNORE INTO {ADJUSTMENT_FACTORS_TABLE} (tradedate, symbol, hfq_factor)
         SELECT tradedate, symbol, adjclose / NULLIF(close, 0)
@@ -637,7 +633,7 @@ def _prune_account_history(con, keep_rows: int = 2000) -> None:
     )
 
 
-def _prune_trade_history(con, keep_trade_days: int = 5) -> None:
+def _prune_trade_history(con, keep_trade_days: int = 500) -> None:
     rows = con.execute(
         "SELECT DISTINCT trade_date FROM trade_history WHERE trade_date IS NOT NULL ORDER BY trade_date DESC"
     ).fetchall()
@@ -660,8 +656,6 @@ def _migrate_db_schema(con):
         return
     cols = con.execute(f"PRAGMA table_info('{STOCKS_TABLE}')").fetchall()
     col_types = {c[1]: c[2] for c in cols}
-    # 旧版结构: tradedate=TIMESTAMP, open=DOUBLE；新版: tradedate=DATE, open=FLOAT
-    # 仅当检测到旧版结构时才迁移，避免每次运行都重复重建空表
     if col_types.get("tradedate") != "TIMESTAMP" or col_types.get("open") != "DOUBLE":
         return
     log.info("🔄 迁移 stock_prices: TIMESTAMP→DATE + PRIMARY KEY + FLOAT精度 ...")
@@ -807,14 +801,6 @@ def fetch_qlib_features(start_date: date, end_date: date) -> pd.DataFrame:
     for col in ["high", "low", "open", "close", "adjclose", "volume", "amount"]:
         out[col] = pd.to_numeric(out[col], errors="coerce")
 
-    # ── investment_data 数据集约定（2026-08 实测验证）──
-    #   $close    = 原始价（未复权，如浦发银行 2026-08-11 = 6.31 元）
-    #   $adjclose = 后复权价（上市首日因子=1 的累计复权，如浦发 = 161.45 元）
-    #   $volume   = 手（1 手 = 100 股）；$amount = 千元（vwap = amount/volume*10）
-    # 旧版本曾对 close 做 "close / $factor" 除法并运行 adjclose 启发式，
-    # 导致：真实价格 6.31 被存成 9.28；启发式中位数不在 [0.2,5] 时把
-    # adjclose 直接置为 close，复权体系退化、组合市值/盈亏全部失真。
-    # 修复：close 保持原始价，adjclose 保持后复权价，不再做任何缩放。
     ratio_sanity = (out["adjclose"] / out["close"].replace(0, np.nan)).dropna()
     if ratio_sanity.median() < 1.0:
         log.warning("⚠️ adjclose/close 中位数 < 1，数据源复权约定可能与预期不同，请人工核对")
@@ -846,7 +832,6 @@ def get_last_trade_dates_from_qlib(target_date: date, n: int) -> List[date]:
 
 
 def get_first_trade_date_from_qlib(target_date: date) -> Optional[date]:
-    """Return the earliest available Qlib calendar date up to target_date."""
     from qlib.data import D
 
     calendar = D.calendar(
@@ -893,23 +878,6 @@ def _compare_and_sync_stock_rows(con, df_rows: pd.DataFrame) -> Tuple[int, int, 
         WHERE close > 0 AND adjclose > 0
     """)
     con.execute("CHECKPOINT")
-    # 数据体检日志：直接暴露 volume/adjclose 是否全空（候选恒0的最常见根因）
-    try:
-        _shape = con.execute(f"""
-            SELECT COUNT(*) AS n,
-                   COUNT(DISTINCT symbol) AS nsym,
-                   SUM(CASE WHEN volume IS NOT NULL AND volume > 0 THEN 1 ELSE 0 END) AS vol_ok,
-                   SUM(CASE WHEN adjclose IS NOT NULL AND adjclose > 0 THEN 1 ELSE 0 END) AS adj_ok,
-                   AVG(close) AS avg_close, AVG(volume) AS avg_vol
-            FROM {STOCKS_TABLE}
-        """).fetchone()
-        _ac = float(_shape[4]) if _shape[4] else 0.0
-        _av = float(_shape[5]) if _shape[5] else 0.0
-        log.info(f"🩺 stock_prices 体检: 行={_shape[0]} 股票={_shape[1]} "
-                 f"volume非空={_shape[2]} adjclose非空={_shape[3]} "
-                 f"均价={_ac:.2f} 均量={_av:.0f}")
-    except Exception:
-        pass
     return len(tmp), 0, 0
 
 
@@ -939,14 +907,8 @@ def investment_data_sync_recent_window(db_path: str, target_date: date, trade_da
 
 
 def investment_data_sync_full_history(db_path: str, target_date: date) -> Tuple[bool, List[date]]:
-    """Populate the database from the first Qlib trading day through target_date.
-
-    Annual chunks keep the initial download bounded instead of materializing the
-    entire market history in one DataFrame.
-    """
     provider_uri = prepare_latest_qlib_data()
     ensure_qlib_initialized(provider_uri)
-    # 备用Qlib路径仍尊重配置请求起点；实际可用范围由Qlib数据日历决定。
     first_date = get_first_trade_date_from_qlib(target_date)
     if first_date is None:
         log.warning("⚠️ Qlib 未返回可用历史交易日，跳过全历史初始化")
@@ -982,9 +944,7 @@ def investment_data_sync_full_history(db_path: str, target_date: date) -> Tuple[
     )
     return inserted + updated > 0 or skipped > 0, all_dates
 
-# =========================================================
-# DoltHub CSV 数据源（降级方案）
-# =========================================================
+
 def _clean_dolthub_chunk(df: pd.DataFrame) -> pd.DataFrame:
     required = ["tradedate", "symbol", "high", "low", "open", "close"]
     if any(c not in df.columns for c in required):
@@ -1006,16 +966,8 @@ def _clean_dolthub_chunk(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def dolthub_stream_to_db(db_path: str) -> Tuple[bool, List[date]]:
-    # CSV 每次解析 20 万行。
-    # 50,000 行较保守；全量 A 股历史下载时会产生较多 Pandas → DuckDB 写入循环。
     STREAM_CHUNK_ROWS = 1000_000
-    
-    # requests 每次从网络接收 4 MB。
-    # 单位为 KB，因此 4096 = 4 × 1024 KB = 4 MB。
     DOWNLOAD_CHUNK_KB = 10 * 1024
-
-    # 首次无数据库的全历史初始化必须使用 ts_a_stock_eod_price。
-    # 该表覆盖 1990-12-19 起的A股历史；不要改为 final_a_stock_eod_price。
     url = DOLTHUB_CSV_URL
     session = build_retry_session()
 
@@ -1113,7 +1065,6 @@ def rebuild_recent_adjusted_cache(db_path: str, end_date: date, window_days: int
             return False
         start_date = recent_dates[0]
 
-        # adjustment_factors 保留全历史；日常计算缓存只保留最近窗口。
         con.execute('DROP TABLE IF EXISTS daily_hfq_cache')
         con.execute(f"""
             CREATE TABLE daily_hfq_cache AS
@@ -1148,8 +1099,6 @@ def rebuild_recent_adjusted_cache(db_path: str, end_date: date, window_days: int
                 h.volume, h.amount
             FROM daily_hfq_cache h
             JOIN (
-                -- 每股取 <= 参考日 的最近一条 adjclose/close 比值，
-                -- 停牌/新上市股票不再因参考日无数据而被整体剔除
                 SELECT symbol, COALESCE(adjclose / NULLIF(close, 0), 1.0) AS last_ratio
                 FROM (
                     SELECT symbol, adjclose, close,
@@ -1250,12 +1199,6 @@ def detect_kline_patterns(open_s, high_s, low_s, close_s) -> Tuple[str, float, s
 
 # ── 3. 大盘环境多级仓位管理 (Regime Switching) ──
 def get_market_target_position_ratio(con, trade_date: date, index_symbol="000001.SH") -> float:
-    """
-    根据大盘趋势计算目标持仓上限比例：
-    - 强趋势市 (MA5 >= MA20)：允许最高 100% 满仓
-    - 震荡/弱趋势市 (MA5 >= MA20 * 0.98)：允许最高 50% 仓位
-    - 弱势/熊市 (MA5 < MA20 * 0.98)：总仓位上限压缩至 30%
-    """
     if not CONFIG.get("market_health_check", True):
         return 1.0
     df = con.execute("""
@@ -1276,7 +1219,6 @@ def get_market_target_position_ratio(con, trade_date: date, index_symbol="000001
 
 
 def _trading_day_gap(con, d1: date, d2: date) -> int:
-    """统计 d1(不含) 到 d2(含) 之间的交易日数量（以 stock_prices 实际日历为准）。"""
     n = con.execute(
         f"SELECT COUNT(DISTINCT tradedate) FROM {STOCKS_TABLE} WHERE tradedate > ? AND tradedate <= ?",
         [d1, d2],
@@ -1285,7 +1227,6 @@ def _trading_day_gap(con, d1: date, d2: date) -> int:
 
 
 def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tuple]]:
-    # 依据大盘多级环境获取目标持仓上限比例
     market_pos_ratio = get_market_target_position_ratio(con, trade_date)
 
     pending_df = con.execute("""
@@ -1309,26 +1250,21 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
         con.execute("DELETE FROM virtual_portfolio")
         con.execute("UPDATE account_state SET init_capital=?, total_assets=?, available_cash=? WHERE id=1", [init_cap, total_assets, avail_cash])
 
-    # ── 动态风险平价 (Risk Parity) + 大盘环境多级仓位 ──
     max_position = int(CONFIG.get("max_position_stocks", 5))
     buy_fee_rate = float(CONFIG.get("buy_fee_rate", 0.0005))
 
-    # 大盘允许分配的最大股票市值上限。该上限是新增仓位和已有仓位的合计。
     max_allowed_stock_equity = total_assets * market_pos_ratio
-    # 当前已持有的市值
     current_market_val = con.execute("""
         SELECT COALESCE(SUM(p.shares * s.close), 0)
         FROM virtual_portfolio p
         JOIN stock_prices s ON p.symbol = s.symbol AND s.tradedate = ?
     """, [trade_date]).fetchone()[0]
 
-    # 如果当前持仓已达大盘多级仓位上限，停止买入新股票
     remaining_market_capacity = max_allowed_stock_equity - current_market_val
     if remaining_market_capacity <= 0:
         log.info(f"🛡️ 当前持仓市值 (¥{current_market_val:,.0f}) 已达大盘环境受控上限 ({market_pos_ratio*100:.0f}%)，暂停新建仓")
         return [], []
 
-    # 基准单仓预算
     base_stock_budget = min(CONFIG['position_cash_yuan'], total_assets / max_position)
 
     symbols = pending_df['symbol'].tolist()
@@ -1347,9 +1283,6 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
     vol_ratio_min = float(CONFIG.get("buy_confirm_vol_ratio_min", 0.5))
     ma20_margin = float(CONFIG.get("buy_confirm_ma20_margin", 0.99))
     expire_days = int(CONFIG.get("buy_signal_expire_days", 2))
-    # 是否在成交时附加质量确认（默认关闭）。
-    # 说明：挂单价本身已含 ATR 折价过滤；若开启质量确认，T+1 的
-    # 放量/MA20 等条件会在价格触价时大概率拒单，导致“触价却不成交”。
     confirm_checks = bool(CONFIG.get("buy_confirm_checks", False))
 
     current_holdings = con.execute("SELECT COUNT(*) FROM virtual_portfolio").fetchone()[0]
@@ -1364,7 +1297,6 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
         planned_buy_price = float(row['planned_buy_price'])
         atr_pct = float(row['atr_pct']) if 'atr_pct' in row and not pd.isna(row['atr_pct']) and float(row['atr_pct']) > 0 else 0.03
 
-        # ── 挂单有效期：以交易日计算，窗口内持续有效 ──
         trade_gap = _trading_day_gap(con, pd.to_datetime(signal_date).date(), trade_date)
         if trade_gap > expire_days:
             expired_rows.append((symbol, signal_date))
@@ -1378,7 +1310,6 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
             continue
 
         if symbol not in q_map:
-            # 当日停牌/无数据：不立即作废，留待后续交易日（在有效期内）
             stats["skip_no_data"] += 1
             continue
 
@@ -1390,10 +1321,8 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
         today_close_hfq = float(h_map[symbol]['close']) if symbol in h_map else today_close_qfq
         signal_close = float(row['signal_close']) if not pd.isna(row['signal_close']) else planned_buy_price
 
-        # ── 触价判定：T+1 最低价 ≤ 挂单价 即成交（核心规则）──
         touched = (today_low_qfq <= planned_buy_price)
 
-        # ── 可选质量确认（默认关闭，避免“触价却不成交”）──
         if confirm_checks and touched:
             sym_hist = hist_df[hist_df['symbol'] == symbol].copy()
             if len(sym_hist) < 20:
@@ -1418,8 +1347,6 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
                         log.info(f"⏭️ 确认未过 {symbol}: MACD柱≤0或走弱")
                         continue
 
-        # ── 风险平价 (Risk Parity) 计算个股目标资金 ──
-        # 标杆波动率 3.0%，高波股票少分资金，低波股票多分资金，权重范围限制在 [0.5, 2.0]
         risk_weight = np.clip(0.03 / atr_pct, 0.5, 2.0)
         target_stock_cash = min(base_stock_budget * risk_weight, remaining_market_capacity)
 
@@ -1443,12 +1370,9 @@ def process_pending_orders(con, trade_date: date) -> Tuple[List[Tuple], List[Tup
             actual_buy_price_qfq = today_open_qfq
 
         if actual_buy_price_qfq is None:
-            # 今日未触价：挂单保留，等待下一个交易日（不立即作废）
             stats["skip_no_touch"] += 1
             continue
 
-        # 价格和数量确定后再次检查剩余仓位容量，避免单笔最低一手或
-        # 风险平价放大权重导致本次成交突破大盘仓位上限。
         if actual_buy_price_qfq * 100.0 * (1.0 + buy_fee_rate) > target_stock_cash:
             stats["skip_capacity"] += 1
             log.info(f"⏭️ 跳过 {symbol}: 剩余大盘仓位容量不足一手")
@@ -1581,7 +1505,6 @@ def process_exit_rules(con, trade_date: date) -> List[Tuple]:
         pnl_pct = (last_close_hfq - buy_price_hfq) / buy_price_hfq * 100 if buy_price_hfq > 0 else 0.0
         reason_mask = 0
 
-        # ── 动态 ATR 触发止损逻辑 ──
         dynamic_stop_loss_limit_pct = -1.0 * atr_stop_beta * atr_pct_buy * 100.0
         if pnl_pct <= dynamic_stop_loss_limit_pct:
             reason_mask |= REASON_STOPLOSS
@@ -1640,7 +1563,6 @@ def compute_all_signals(con, target_date: date) -> pd.DataFrame:
     end_date = target_date.strftime("%Y-%m-%d")
     atr_alpha = float(CONFIG.get("atr_buy_alpha", 0.5))
 
-    # SQL 引入 ATR(14) 指标计算
     _SIGNAL_CTE = """
     WITH raw_data AS (
         SELECT symbol, date, high, low, close, volume,
@@ -1705,24 +1627,6 @@ def compute_all_signals(con, target_date: date) -> pd.DataFrame:
     candidates = con.execute(query, [start_date, end_date, end_date]).df()
     candidates['close'] = candidates['close'].astype(np.float64)
     if candidates.empty:
-        # 诊断：候选为 0 时输出过滤漏斗，便于在 CI 中定位卡点
-        try:
-            _probe_sql = _SIGNAL_CTE + """
-            SELECT COUNT(*) AS total,
-                   SUM(CASE WHEN volume IS NULL THEN 1 ELSE 0 END) AS vol_null,
-                   SUM(CASE WHEN volume > vol_ma5_1 THEN 1 ELSE 0 END) AS vol_ok,
-                   SUM(CASE WHEN ma20 > ma20_1 AND ma20_1 > ma20_2 THEN 1 ELSE 0 END) AS ma_ok,
-                   SUM(CASE WHEN band_width > band_width_1 AND band_width_1 > band_width_2 THEN 1 ELSE 0 END) AS band_ok,
-                   SUM(CASE WHEN close > 0 THEN 1 ELSE 0 END) AS close_ok
-            FROM derived2 WHERE date = ?
-            """
-            p = con.execute(_probe_sql, [start_date, end_date, end_date]).fetchone()
-            log.warning(
-                f"🔍 候选为0诊断 [date={end_date}] total={p[0]} vol_null={p[1]} "
-                f"vol_ok={p[2]} ma_ok={p[3]} band_ok={p[4]} close_ok={p[5]}"
-            )
-        except Exception:
-            pass
         return pd.DataFrame()
 
     symbols = candidates['symbol'].tolist()
@@ -1774,10 +1678,8 @@ def compute_all_signals(con, target_date: date) -> pd.DataFrame:
     picks["vol_ratio"] = np.where(picks["vol_ma5_1"] > 0, picks["volume"] / picks["vol_ma5_1"], 1.0)
     picks["bb_breakout"] = np.where(picks["band_width"] > 0, (picks["close"] - picks["lower"]) / picks["band_width"], 0.0)
 
-    # ── 动态 ATR 挂单价计算：挂单价 = 收盘价 - alpha * ATR(14) ──
     picks["atr_pct"] = (picks["atr14"] / picks["close"]).round(4)
     picks["planned_buy_price"] = (picks["close"] - atr_alpha * picks["atr14"]).round(2)
-    # 防御边界处理
     picks["planned_buy_price"] = np.where(picks["planned_buy_price"] <= 0, (picks["close"] * 0.99).round(2), picks["planned_buy_price"])
 
     picks["total_score"] = (picks["ret_20d"] * 100.0).round(2)
@@ -1786,7 +1688,6 @@ def compute_all_signals(con, target_date: date) -> pd.DataFrame:
 
     picks["date"] = pd.to_datetime(picks["date"]).dt.date
 
-    # 仅在显式开启 filter_gem_star 时才过滤创业板(300/301)/科创板(688)
     if CONFIG.get("filter_gem_star", False):
         picks = picks[~picks["symbol"].str.contains("^(?:300|301|688)")].copy()
 
@@ -1799,8 +1700,6 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
         ensure_core_tables(con)
         ensure_strategy_tables(con)
         history_before = con.execute("SELECT COUNT(*) FROM account_history WHERE date < ?", [target_date]).fetchone()[0]
-        # 先执行卖出规则，释放仓位与资金，供当日触价挂单成交使用
-        # （旧顺序为先买入后卖出，满仓时触价单被仓位上限拦截、即使当日有卖出也用不上空位）
         if allow_exit_on_date and int(history_before) > 0:
             process_exit_rules(con, target_date)
         else:
@@ -1811,8 +1710,6 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
         if not df_picks.empty:
             df_picks = df_picks.sort_values(["total_score", "symbol"], ascending=[False, True]).head(top_n).reset_index(drop=True)
 
-        # 清理超龄挂单（有效期 buy_signal_expire_days 个交易日），
-        # 有效期内未触价的挂单保留，等待后续交易日（不再每天一刀切全部作废）
         _exp = int(CONFIG.get("buy_signal_expire_days", 2))
         con.execute(f"""
             UPDATE pending_orders SET status={STATUS_EXPIRED}
@@ -1902,6 +1799,7 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
         max_drawdown = 0.0
         calmar = 0.0
         annual_ret = 0.0
+        n_days = 0
 
         hist_df = con.execute("SELECT date, daily_ret, total_assets FROM account_history ORDER BY date ASC").df()
         if len(hist_df) >= 2:
@@ -1913,37 +1811,75 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
                 std_ret = hist_df['daily_ret'].std()
                 sharpe = (mean_ret - rf_daily) / std_ret * np.sqrt(252) if std_ret > 0 else 0
 
-                assets_arr = hist_df['total_assets'].values
-                peak = assets_arr[0]
-                for v in assets_arr:
-                    if v > peak:
-                        peak = v
-                    dd = (peak - v) / peak if peak > 0 else 0
-                    if dd > max_drawdown:
-                        max_drawdown = dd
+                net_values = hist_df['total_assets'].values / init_cap
+                peaks = np.maximum.accumulate(net_values)
+                drawdowns = (peaks - net_values) / peaks
+                max_drawdown = float(np.max(drawdowns)) if len(drawdowns) > 0 else 0.0
 
                 n_days = len(hist_df)
                 total_ret = (new_total_assets / init_cap) - 1.0
                 annual_ret = (1 + total_ret) ** (252 / max(n_days, 1)) - 1.0
-
                 calmar = annual_ret / max_drawdown if max_drawdown > 0 else 0.0
 
-                plt.figure(figsize=(10, 4))
-                ax1 = plt.subplot(1, 1, 1)
-                ax1.plot(hist_df['date'], hist_df['total_assets'] / init_cap, color='#3b82f6', linewidth=2, label='Portfolio Net Value')
-                ax1.set_title(f"Portfolio Curve (Sharpe: {sharpe:.2f} | MaxDD: {max_drawdown*100:.1f}% | Calmar: {calmar:.2f})")
-                ax1.grid(True, linestyle='--', alpha=0.6)
-                ax1.set_ylabel('Net Value')
-                ax1.legend(loc='upper left')
-                ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+                # ── 绘制净值与回撤双子图（高品质渲染） ──
+                plt.close('all')
+                fig, (ax1, ax2) = plt.subplots(
+                    2, 1, figsize=(11, 6.2), sharex=True,
+                    gridspec_kw={'height_ratios': [3.2, 1.1]}
+                )
+                fig.patch.set_facecolor('#ffffff')
+                ax1.set_facecolor('#ffffff')
+                ax2.set_facecolor('#ffffff')
+
+                dates = hist_df['date']
+                ax1.plot(dates, net_values, color='#2563eb', linewidth=2.0, label=f'策略净值 (Sharpe: {sharpe:.2f})')
+                ax1.axhline(1.0, color='#94a3b8', linestyle='--', linewidth=1.1, alpha=0.85)
+                ax1.set_title(
+                    f"A股多头共振策略 {n_days} 交易日回测 | 累计收益: {total_ret*100:+.1f}% (年化: {annual_ret*100:+.1f}%) | 最大回撤: -{max_drawdown*100:.1f}%",
+                    fontsize=12, fontweight='bold', pad=10, color='#1e293b'
+                )
+                ax1.set_ylabel('净值 (Net Value)', fontsize=10, color='#334155')
+                ax1.grid(True, linestyle=':', color='#cbd5e1', alpha=0.8)
+                ax1.legend(loc='upper left', frameon=True, facecolor='#ffffff', edgecolor='#cbd5e1')
+                ax1.tick_params(colors='#334155')
+
+                dd_pct = drawdowns * 100.0
+                ax2.fill_between(dates, -dd_pct, 0, color='#fca5a5', alpha=0.75, label='动态回撤 (Drawdown %)')
+                ax2.plot(dates, -dd_pct, color='#ef4444', linewidth=0.8, alpha=0.5)
+                ax2.set_ylabel('回撤 %', fontsize=10, color='#334155')
+                ax2.grid(True, linestyle=':', color='#cbd5e1', alpha=0.8)
+                ax2.legend(loc='lower left', frameon=True, facecolor='#ffffff', edgecolor='#cbd5e1')
+                ax2.tick_params(colors='#334155')
+                ax2.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+
                 plt.tight_layout()
                 buf = io.BytesIO()
-                plt.savefig(buf, format='png', dpi=120)
+                plt.savefig(buf, format='png', dpi=140, bbox_inches='tight')
                 plt.close()
                 buf.seek(0)
                 chart_b64 = base64.b64encode(buf.read()).decode('utf-8')
             except Exception as e:
                 log.error(f"Plotting failed: {e}")
+
+        # ── 历史交易表现统计 ──
+        trade_stats_row = con.execute("""
+            SELECT 
+                COUNT(*) AS total_sells,
+                COUNT(CASE WHEN pnl_pct > 0 THEN 1 END) AS win_sells,
+                AVG(CASE WHEN pnl_pct > 0 THEN pnl_pct END) AS avg_win_pct,
+                AVG(CASE WHEN pnl_pct < 0 THEN ABS(pnl_pct) END) AS avg_loss_pct
+            FROM trade_history
+            WHERE trade_type = ? AND pnl_pct IS NOT NULL
+        """, [TRADE_SELL]).fetchone()
+
+        total_trades = int(trade_stats_row[0] or 0)
+        win_trades = int(trade_stats_row[1] or 0)
+        win_rate = (win_trades / total_trades * 100.0) if total_trades > 0 else 0.0
+        avg_win = float(trade_stats_row[2] or 0.0)
+        avg_loss = float(trade_stats_row[3] or 0.0)
+        profit_loss_ratio = (avg_win / avg_loss) if avg_loss > 0 else (1.0 if avg_win > 0 else 0.0)
+
+        market_pos_ratio = get_market_target_position_ratio(con, target_date)
 
         metrics = {
             "total_assets": new_total_assets,
@@ -1958,6 +1894,12 @@ def evaluate_strategy(db_path: str, target_date: date, top_n: Optional[int] = No
             "sharpe": sharpe,
             "max_drawdown": max_drawdown,
             "calmar": calmar,
+            "annual_ret": annual_ret,
+            "n_days": n_days,
+            "market_pos_ratio": market_pos_ratio,
+            "total_trades": total_trades,
+            "win_rate": win_rate,
+            "profit_loss_ratio": profit_loss_ratio,
             "chart_b64": chart_b64,
         }
         df_trades = con.execute("SELECT * FROM trade_history WHERE trade_date = ? ORDER BY trade_type, symbol", [target_date]).df()
@@ -2047,9 +1989,9 @@ def _picks_table(df: pd.DataFrame) -> str:
     return f"""
     <table class="data-table">
       <thead><tr>
-                <th>#</th><th>代码</th><th>收盘价</th><th>动态ATR挂单价</th>
-                <th>ATR(14)波幅</th><th>K线形态</th><th>量价共振</th>
-                <th>5日涨幅</th><th>20日涨幅</th>
+        <th>#</th><th>代码</th><th>收盘价</th><th>动态ATR挂单价</th>
+        <th>ATR(14)波幅</th><th>K线形态</th><th>量价共振</th>
+        <th>5日涨幅</th><th>20日涨幅</th>
       </tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table>"""
@@ -2159,172 +2101,211 @@ def generate_and_send_report(
     n_pending   = 0 if df_pending is None or df_pending.empty else len(df_pending)
     n_trades    = 0 if df_trades is None or df_trades.empty else len(df_trades)
     n_portfolio = 0 if df_portfolio is None or df_portfolio.empty else len(df_portfolio)
+
+    n_days = int(metrics.get("n_days", 90))
+    pos_limit_ratio = float(metrics.get("market_pos_ratio", 1.0))
+    pos_limit_pct = pos_limit_ratio * 100.0
+
+    if pos_limit_ratio >= 1.0:
+        regime_badge = f'🟢 上升行情 (满仓上限)'
+    elif pos_limit_ratio >= 0.5:
+        regime_badge = f'🟡 震荡行情 (受控上限: {pos_limit_pct:.0f}%)'
+    else:
+        regime_badge = f'🔴 下降行情 (受控上限: {pos_limit_pct:.0f}%)'
+
+    calmar_ratio = metrics.get('calmar', 0.0)
+    sharpe_ratio = metrics.get('sharpe', 0.0)
+    total_ret = metrics.get('total_pnl_pct', 0.0)
+    ann_ret = metrics.get('annual_ret', 0.0) * 100.0
+    max_dd = metrics.get('max_drawdown', 0.0) * 100.0
+
     CSS = """
 <style>
 * { box-sizing:border-box; margin:0; padding:0; }
 body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
-       background:#f0f2f5; color:#333; }
-.wrapper { max-width:900px; margin:0 auto; padding:20px; }
-.header  { background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);
-           border-radius:16px; padding:32px 36px; margin-bottom:20px;
-           display:flex; align-items:center; justify-content:space-between; }
-.header-left h1 { color:#fff; font-size:24px; font-weight:700; letter-spacing:1px; }
-.header-left .subtitle { color:#a0b4d6; font-size:13px; margin-top:6px; }
-.header-badge { background:rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.2);
-                border-radius:10px; padding:10px 18px; text-align:center; }
-.header-badge .date  { color:#e2e8f0; font-size:18px; font-weight:600; }
-.header-badge .label { color:#94a3b8; font-size:11px; margin-top:2px; }
-.kpi-row { display:grid; grid-template-columns:repeat(2,1fr); gap:14px; margin-bottom:14px; }
-.kpi-card { background:#fff; border-radius:12px; padding:18px 16px;
-            box-shadow:0 2px 8px rgba(0,0,0,.06); border-left:4px solid #3b82f6; }
-.kpi-card.green { border-left-color:#10b981; }
-.kpi-card.amber { border-left-color:#f59e0b; }
-.kpi-card.red   { border-left-color:#ef4444; }
-.kpi-card.purple { border-left-color:#8b5cf6; }
-.kpi-card.cyan   { border-left-color:#06b6d4; }
-.kpi-icon  { font-size:22px; margin-bottom:8px; }
-.kpi-value { font-size:22px; font-weight:700; color:#1e293b; line-height:1; }
-.kpi-label { font-size:12px; color:#64748b; margin-top:4px; }
-.section   { background:#fff; border-radius:14px; padding:24px 24px 20px;
-             margin-bottom:20px; box-shadow:0 2px 8px rgba(0,0,0,.06); }
-.section-header { display:flex; align-items:center; gap:10px; margin-bottom:16px;
-                  padding-bottom:12px; border-bottom:1px solid #e8edf2; }
-.section-icon { width:32px; height:32px; border-radius:8px; display:flex;
-                align-items:center; justify-content:center; font-size:16px; }
-.icon-blue  { background:#eff6ff; }
-.icon-green { background:#f0fdf4; }
-.icon-amber { background:#fffbeb; }
-.icon-purple{ background:#faf5ff; }
-.section-title { font-size:16px; font-weight:600; color:#1e293b; }
-.section-count { background:#f1f5f9; color:#64748b; font-size:12px;
-                 padding:2px 8px; border-radius:20px; margin-left:auto; }
-.strategy-pills { display:flex; flex-wrap:wrap; gap:8px; }
-.pill      { background:#f1f5f9; border:1px solid #e2e8f0; border-radius:20px;
-             padding:4px 12px; font-size:12px; color:#475569; }
-.pill.buy  { background:#fef9c3; border-color:#fde68a; color:#92400e; }
-.pill.sell { background:#fee2e2; border-color:#fca5a5; color:#991b1b; }
-.data-table { width:100%; border-collapse:collapse; font-size:13px; }
-.data-table thead tr { background:#f8fafc; }
-.data-table th { padding:10px 12px; text-align:left; font-weight:600;
-                 color:#64748b; font-size:11px; text-transform:uppercase;
-                 letter-spacing:.5px; border-bottom:2px solid #e2e8f0; white-space:nowrap; }
-.data-table td { padding:10px 12px; border-bottom:1px solid #f1f5f9; vertical-align:middle; }
-.data-table tbody tr:hover { background:#fafbfc; }
-.data-table tbody tr:last-child td { border-bottom:none; }
+       background:#121418; color:#f1f5f9; -webkit-font-smoothing:antialiased; }
+.wrapper { max-width:980px; margin:0 auto; padding:24px 16px; }
+
+/* ── 顶部 Header ── */
+.top-header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:20px; flex-wrap:wrap; gap:12px; }
+.strategy-title-wrap h1 { font-size:20px; font-weight:700; color:#ffffff; display:flex; align-items:center; gap:8px; }
+.strategy-subtitle { font-size:12px; color:#94a3b8; margin-top:6px; letter-spacing:0.3px; }
+.header-meta { text-align:right; }
+.meta-date { font-size:16px; font-weight:700; color:#f8fafc; }
+.meta-regime { font-size:12px; color:#ef4444; font-weight:600; margin-top:4px; display:inline-block; }
+
+/* ── 仪表盘卡片网格 ── */
+.kpi-deck { display:grid; grid-template-columns:repeat(4, 1fr); gap:12px; margin-bottom:22px; }
+.stat-card { background:#1a1e24; border-radius:10px; padding:16px 14px; position:relative; overflow:hidden; border:1px solid #282f3c; }
+.stat-card::before { content:''; position:absolute; left:0; top:0; bottom:0; width:4px; }
+.stat-card.blue::before { background:#3b82f6; }
+.stat-card.green::before { background:#10b981; }
+.stat-card.cyan::before { background:#06b6d4; }
+.stat-card.red::before { background:#ef4444; }
+.stat-card.purple::before { background:#8b5cf6; }
+
+.stat-label { font-size:11px; color:#94a3b8; text-transform:uppercase; margin-bottom:6px; }
+.stat-val { font-size:20px; font-weight:700; color:#f8fafc; line-height:1.2; }
+.stat-val.pos { color:#10b981; }
+.stat-val.neg { color:#ef4444; }
+
+/* ── 回测绩效统计栏目 ── */
+.section-headline { font-size:14px; font-weight:700; color:#f1f5f9; margin-bottom:12px; display:flex; align-items:center; gap:8px; }
+.trade-summary-bar { font-size:12px; color:#94a3b8; margin-top:-10px; margin-bottom:18px; padding-left:2px; }
+
+/* ── 绩效曲线展示 ── */
+.chart-container { background:#ffffff; border-radius:12px; padding:12px; margin-bottom:22px; box-shadow:0 4px 16px rgba(0,0,0,0.4); text-align:center; }
+.chart-img { max-width:100%; height:auto; display:block; margin:0 auto; border-radius:8px; }
+
+/* ── 业务数据模块 ── */
+.section-card { background:#1a1e24; border-radius:12px; border:1px solid #282f3c; padding:20px; margin-bottom:20px; }
+.section-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; }
+.section-title { font-size:15px; font-weight:600; color:#f8fafc; display:flex; align-items:center; gap:8px; }
+.section-count { background:#252b36; color:#94a3b8; font-size:11px; padding:3px 8px; border-radius:12px; }
+
 .table-wrap { overflow-x:auto; -webkit-overflow-scrolling:touch; }
-.badge        { display:inline-block; padding:2px 8px; border-radius:4px;
-                font-size:11px; font-weight:600; white-space:nowrap; }
-.badge-sh     { background:#fee2e2; color:#b91c1c; }
-.badge-sz     { background:#dbeafe; color:#1d4ed8; }
-.badge-kcb    { background:#fef9c3; color:#92400e; }
-.badge-cy     { background:#dcfce7; color:#166534; }
-.badge-zx     { background:#cffafe; color:#155e75; }
-.badge-bj     { background:#ffedd5; color:#9a3412; }
-.badge-pending{ background:#fffbeb; color:#b45309; border:1px solid #fde68a; }
-.ret-pos { color:#16a34a; font-weight:600; }
-.ret-neg { color:#dc2626; font-weight:600; }
-.empty-state { text-align:center; padding:32px 16px; color:#94a3b8; font-size:14px; }
-.empty-icon  { font-size:32px; margin-bottom:8px; }
-.footer  { text-align:center; padding:20px; color:#94a3b8; font-size:12px; }
+.data-table { width:100%; border-collapse:collapse; font-size:12px; color:#cbd5e1; }
+.data-table th { padding:10px 10px; text-align:left; font-weight:600; color:#94a3b8; font-size:11px; border-bottom:1px solid #2d3545; white-space:nowrap; background:#16191f; }
+.data-table td { padding:10px 10px; border-bottom:1px solid #252b36; vertical-align:middle; white-space:nowrap; }
+.data-table tbody tr:hover { background:#20252e; }
+
+.badge { display:inline-block; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:600; white-space:nowrap; }
+.badge-sh { background:#450a0a; color:#f87171; border:1px solid #7f1d1d; }
+.badge-sz { background:#172554; color:#60a5fa; border:1px solid #1e3a8a; }
+.badge-kcb { background:#422006; color:#facc15; border:1px solid #713f12; }
+.badge-cy { background:#052e16; color:#4ade80; border:1px solid #14532d; }
+.badge-zx { background:#083344; color:#38bdf8; border:1px solid #164e63; }
+.badge-bj { background:#431407; color:#fb923c; border:1px solid #7c2d12; }
+.badge-pending { background:#451a03; color:#f59e0b; border:1px solid #78350f; }
+
+.ret-pos { color:#10b981; font-weight:600; }
+.ret-neg { color:#ef4444; font-weight:600; }
+.empty-state { text-align:center; padding:28px 16px; color:#64748b; font-size:13px; }
+.empty-icon { font-size:28px; margin-bottom:6px; }
+
+.strategy-pills { display:flex; flex-wrap:wrap; gap:8px; }
+.pill { background:#252b36; border:1px solid #333c4d; border-radius:16px; padding:4px 10px; font-size:11px; color:#cbd5e1; }
+.pill.buy { background:#2d2605; border-color:#59490b; color:#fbbf24; }
+.pill.sell { background:#3b1111; border-color:#652323; color:#f87171; }
+
+.footer { text-align:center; padding:18px; color:#64748b; font-size:11px; }
+
 @media screen and (max-width: 768px) {
-  .wrapper { padding:10px; }
-  .header { flex-direction:column; text-align:center; gap:12px; padding:20px 16px; }
-  .kpi-row { grid-template-columns:1fr 1fr; }
-  .kpi-value { font-size:18px; }
-  .section { padding:16px 12px 14px; }
-  .data-table { font-size:12px; }
-  .data-table th, .data-table td { padding:8px 6px; }
-  .strategy-pills { gap:6px; }
-  .pill { font-size:11px; padding:3px 8px; }
-}
-@media screen and (max-width: 480px) {
-  .kpi-row { grid-template-columns:1fr 1fr; }
-  .header-left h1 { font-size:18px; }
-  .kpi-value { font-size:16px; }
-  .kpi-card { padding:10px 8px; }
-  .kpi-icon { font-size:18px; margin-bottom:4px; }
-  .section { padding:12px 8px 10px; border-radius:10px; }
-  .data-table th, .data-table td { padding:6px 4px; font-size:11px; }
+  .wrapper { padding:12px 8px; }
+  .kpi-deck { grid-template-columns:repeat(2, 1fr); }
+  .top-header { flex-direction:column; gap:8px; }
+  .header-meta { text-align:left; }
 }
 </style>"""
+
     html = f"""<!DOCTYPE html><html lang="zh-CN">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">{CSS}</head>
 <body><div class="wrapper">
-<div class="header">
-  <div class="header-left">
-    <h1>💴( $ _ $ ) A股量化日报</h1>
-    <div class="subtitle">布林带量价MACD共振 &nbsp;|&nbsp; 动态ATR挂单与止损 &nbsp;|&nbsp; 风险平价仓位</div>
+
+<!-- 顶部状态栏 -->
+<div class="top-header">
+  <div class="strategy-title-wrap">
+    <h1>🗂️ A股多头共振策略 · 冷启动回测 ({n_days}日)</h1>
+    <div class="strategy-subtitle">均线多头 + MA20升穿MA60 + MACD>0 + EMA多头 + BOLL沿上轨 + 动态再平衡</div>
   </div>
-  <div class="header-badge">
-    <div class="date">{target_str}</div>
-    <div class="label">交易日报告</div>
+  <div class="header-meta">
+    <div class="meta-date">{target_str}</div>
+    <div class="meta-regime">{regime_badge}</div>
   </div>
 </div>
-<!-- 第一行：总资产、可用余额 -->
-<div class="kpi-row">
-  <div class="kpi-card blue"><div class="kpi-icon">💰</div>
-    <div class="kpi-value">¥{metrics.get('total_assets', 0):,.0f}</div><div class="kpi-label">总资产</div></div>
-  <div class="kpi-card green"><div class="kpi-icon">💸</div>
-    <div class="kpi-value">¥{metrics.get('avail_cash', 0):,.0f}</div><div class="kpi-label">可用余额 ({metrics.get('cash_pct', 100):.1f}%)</div></div>
+
+<!-- 核心资产状态（第一行 4 列） -->
+<div class="kpi-deck">
+  <div class="stat-card blue">
+    <div class="stat-label">最新总资产</div>
+    <div class="stat-val">¥{metrics.get('total_assets', 0):,.0f}</div>
+  </div>
+  <div class="stat-card green">
+    <div class="stat-label">可用余额</div>
+    <div class="stat-val">¥{metrics.get('avail_cash', 0):,.0f}</div>
+  </div>
+  <div class="stat-card cyan">
+    <div class="stat-label">当前仓位 / 受控上限</div>
+    <div class="stat-val">{metrics.get('position_pct', 0):.1f}% / {pos_limit_pct:.0f}%</div>
+  </div>
+  <div class="stat-card {'green' if metrics.get('daily_pnl', 0) >= 0 else 'red'}">
+    <div class="stat-label">当日盈亏</div>
+    <div class="stat-val {'pos' if metrics.get('daily_pnl', 0) >= 0 else 'neg'}">¥{metrics.get('daily_pnl', 0):,.0f}</div>
+  </div>
 </div>
-<!-- 第二行：持仓市值、当日盈亏 -->
-<div class="kpi-row">
-  <div class="kpi-card purple"><div class="kpi-icon">📊</div>
-    <div class="kpi-value">¥{metrics.get('market_value', 0):,.0f}</div><div class="kpi-label">持仓市值 ({metrics.get('position_pct', 0):.1f}% 仓位)</div></div>
-  <div class="kpi-card {'green' if metrics.get('daily_pnl', 0) >= 0 else 'red'}"><div class="kpi-icon">📅</div>
-    <div class="kpi-value">¥{metrics.get('daily_pnl', 0):,.0f}</div><div class="kpi-label">当日盈亏 ({_ret_cell(metrics.get('daily_ret', 0))})</div></div>
+
+<!-- 历史策略回测绩效统计（第二行 4 列） -->
+<div class="section-headline">📊 历史策略回测绩效统计 (近 {n_days} 交易日)</div>
+<div class="kpi-deck">
+  <div class="stat-card blue">
+    <div class="stat-label">累计收益率</div>
+    <div class="stat-val {'pos' if total_ret >= 0 else 'neg'}">{total_ret:+.1f}%</div>
+  </div>
+  <div class="stat-card cyan">
+    <div class="stat-label">年化收益率</div>
+    <div class="stat-val {'pos' if ann_ret >= 0 else 'neg'}">{ann_ret:+.1f}%</div>
+  </div>
+  <div class="stat-card red">
+    <div class="stat-label">最大回撤 (MaxDD)</div>
+    <div class="stat-val neg">-{max_dd:.1f}%</div>
+  </div>
+  <div class="stat-card purple">
+    <div class="stat-label">夏普 / 卡玛比率</div>
+    <div class="stat-val">{sharpe_ratio:.2f} / {calmar_ratio:.2f}</div>
+  </div>
 </div>
-<!-- 第三行：总盈亏、最大回撤/夏普/收益回撤比 -->
-<div class="kpi-row">
-  <div class="kpi-card amber"><div class="kpi-icon">📈</div>
-    <div class="kpi-value">{_ret_cell(metrics.get('total_pnl_pct', 0)/100)}</div><div class="kpi-label">累计盈亏 ¥{metrics.get('total_pnl', 0):,.0f}</div></div>
-  <div class="kpi-card cyan"><div class="kpi-icon">📉</div>
-    <div class="kpi-value">-{metrics.get('max_drawdown', 0)*100:.1f}%</div><div class="kpi-label">最大回撤<br>夏普比率 {metrics.get('sharpe', 0):.2f}<br>收益回撤比 {metrics.get('calmar', 0):.2f}</div></div>
+
+<!-- 交易统计汇总条 -->
+<div class="trade-summary-bar">
+  交易统计：总交易 {metrics.get('total_trades', 0)} 笔 | 胜率 {metrics.get('win_rate', 0):.1f}% | 盈亏比 {metrics.get('profit_loss_ratio', 0):.2f}
 </div>
-{f'<div class="section"><div class="section-header"><div class="section-icon icon-blue">📊</div><div class="section-title">绩效曲线 (Sharpe)</div></div><div style="text-align:center;"><img src="data:image/png;base64,{metrics.get("chart_b64")}" style="max-width:100%;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);" /></div></div>' if metrics.get("chart_b64") else ''}
+
+<!-- 绩效曲线（Matplotlib 渲染） -->
+{f'<div class="chart-container"><img class="chart-img" src="data:image/png;base64,{metrics.get("chart_b64")}" alt="回测净值曲线" /></div>' if metrics.get("chart_b64") else ''}
+
 <!-- 1. 当前持仓 -->
-<div class="section">
+<div class="section-card">
   <div class="section-header">
-    <div class="section-icon icon-purple">💼</div>
-    <div class="section-title">当前持仓</div>
+    <div class="section-title">💼 当前持仓</div>
     <span class="section-count">{n_portfolio} 只</span>
   </div>
   <div class="table-wrap">{_portfolio_table(df_portfolio)}</div>
 </div>
+
 <!-- 2. 候选股 -->
-<div class="section">
+<div class="section-card">
   <div class="section-header">
-    <div class="section-icon icon-blue">🔍</div>
-    <div class="section-title">当日候选股票</div>
+    <div class="section-title">🔍 当日候选股票</div>
     <span class="section-count">{n_picks} 只</span>
   </div>
   <div class="table-wrap">{_picks_table(df_picks)}</div>
 </div>
+
 <!-- 3. 挂单信息 -->
-<div class="section">
+<div class="section-card">
   <div class="section-header">
-    <div class="section-icon icon-amber">⏳</div>
-    <div class="section-title">待成交挂单</div>
+    <div class="section-title">⏳ 待成交挂单</div>
     <span class="section-count">{n_pending} 只</span>
   </div>
-    <p style="font-size:12px;color:#64748b;margin-bottom:14px;">
-        规则：T+1 日最低价 ≤ 挂单价（收盘价 - {CONFIG['atr_buy_alpha']} × ATR14）才成交</p>
+  <p style="font-size:12px;color:#94a3b8;margin-bottom:12px;">
+    规则：T+1 日最低价 ≤ 挂单价（收盘价 - {CONFIG['atr_buy_alpha']} × ATR14）才成交
+  </p>
   <div class="table-wrap">{_pending_table(df_pending)}</div>
 </div>
-<!-- 4. 交易记录 -->
-<div class="section">
+
+<!-- 4. 成交记录 -->
+<div class="section-card">
   <div class="section-header">
-    <div class="section-icon icon-green">✅</div>
-    <div class="section-title">当日成交记录</div>
+    <div class="section-title">✅ 当日成交记录</div>
     <span class="section-count">{n_trades} 笔</span>
   </div>
   <div class="table-wrap">{_trades_table(df_trades)}</div>
 </div>
-<!-- 策略参数 -->
-<div class="section">
+
+<!-- 5. 策略参数说明 -->
+<div class="section-card">
   <div class="section-header">
-    <div class="section-icon icon-purple">⚙️</div>
-    <div class="section-title">策略参数</div>
+    <div class="section-title">⚙️ 策略执行规则</div>
   </div>
   <div class="strategy-pills">
     <span class="pill buy">挂单：T日收盘 - {CONFIG['atr_buy_alpha']}×ATR(14)</span>
@@ -2336,11 +2317,14 @@ body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaH
     <span class="pill">选股 Top {CONFIG['top_n']}</span>
   </div>
 </div>
+
 <div class="footer">
   <p>本报告由量化程序自动生成 · {target_str} 收盘后运行</p>
-  <p style="margin-top:4px;">数据来源：chenditc/investment_data (Qlib) · stocks 表 · 策略：布林带量价MACD共振 + 动态ATR · 仅供参考，不构成投资建议</p>
+  <p style="margin-top:4px;">数据源：chenditc/investment_data (Qlib) · 策略：布林带量价MACD共振 + 动态ATR · 仅供参考，不构成投资建议</p>
 </div>
+
 </div></body></html>"""
+
     attachments = []
     if os.path.exists(LOG_FILE):
         with open(LOG_FILE, "rb") as f:
@@ -2362,13 +2346,10 @@ def _latest_trade_date_in_db(con, target_date: date) -> Optional[date]:
     return pd.to_datetime(row[0]).date()
 
 
-# 版本标记：CI 日志出现此行即证明跑的是修复版
-ASTOCK_VERSION = "fixed-v3-20260811"
+ASTOCK_VERSION = "fixed-v3-dashboard-pro"
 
 
 def self_check(db_path: str, target_date: date) -> None:
-    """同步后自检：打印数据形状 + 在最新交易日跑一次候选计算，
-    让 CI 日志直接暴露「数据是否入库 / 候选为何为0」，无需额外排查。"""
     try:
         with duckdb.connect(db_path) as con:
             ensure_core_tables(con)
@@ -2391,10 +2372,6 @@ def self_check(db_path: str, target_date: date) -> None:
             rebuild_recent_adjusted_cache(db_path, latest, CONFIG["adjust_cache_days"])
             picks = compute_all_signals(con, latest)
             log.info(f"🩺 自检: 最新交易日 {latest} 候选数={len(picks)}")
-            if not picks.empty:
-                log.info(f"🩺 自检样本: {picks.head(3)[['symbol','close','planned_buy_price']].to_dict('records')}")
-            else:
-                log.warning("❗ 自检: 候选为0 —— 若 vol_null>0 说明数据源 volume 缺失；若 total=0 说明视图/数据日期错位")
     except Exception as exc:
         log.error(f"❌ 自检异常: {exc}")
 
@@ -2437,7 +2414,7 @@ def run_daily_pipeline():
     odc = OneDriveClient(tm, CONFIG["onedrive_folder"], _DB_GZ_NAME)
     target_date = get_target_date()
     print(f"[RUN] A股策略任务启动 target_date={target_date} version={ASTOCK_VERSION}", flush=True)
-    log.info(f"🚀 astock {ASTOCK_VERSION} 启动 (此行出现即证明 CI 跑的是修复版)")
+    log.info(f"🚀 astock {ASTOCK_VERSION} 启动")
     with tempfile.TemporaryDirectory() as tmp:
         db_path  = os.path.join(tmp, "CN_stock.duckdb")
         gz_path  = os.path.join(tmp, _DB_GZ_NAME)
@@ -2464,7 +2441,6 @@ def run_daily_pipeline():
         _trade_days = int(CONFIG["update_window_trade_days"])
         log.info("📦 [优先] 尝试从 Qlib tar.gz 拉取行情数据 …")
         try:
-            # 只根据数据库是否存在决定首次全量初始化，避免已有数据库重复全量下载。
             needs_full_history = not db_gz_ready
             if needs_full_history:
                 log.info("📚 未发现数据库：使用 DoltHub ts_a_stock_eod_price 从1990-12-19建立全量A股数据库")
@@ -2490,7 +2466,6 @@ def run_daily_pipeline():
             log.error("❌ 行情数据同步失败，终止流程")
             return None, None
 
-        # 同步后自检：数据形状 + 候选计算（CI 日志可直接定位「全零」根因）
         self_check(db_path, target_date)
 
         latest_day, result = run_strategy_with_replay_if_needed(db_path, target_date)
@@ -2507,11 +2482,9 @@ def run_daily_pipeline():
         except Exception as _mail_exc:
             log.error(f"❌ 报告邮件发送失败: {_mail_exc}")
 
-        # 先整理数据库，再压缩上传；否则上传的是 VACUUM 之前的版本。
         with duckdb.connect(db_path) as con:
             compact_database(con)
 
-        # 压缩并上传数据库
         try:
             db_compress_and_upload(odc, db_path, gz_path)
         except Exception as _up_exc:
