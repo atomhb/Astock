@@ -99,7 +99,7 @@ CONFIG = {
     "top_n": 20,
     "adjust_cache_days": 380,               # 足够长的缓存窗口，防止指标边界碰撞
     "source_cache_ttl_seconds": 6 * 3600,
-    "update_window_trade_days": 3000,        # 扩大至 250 交易日，确保 Qlib 连续覆盖
+    "update_window_trade_days": 10000,        # 扩大至 250 交易日，确保 Qlib 连续覆盖
     "initial_replay_trade_days": 300,       # 初始回测天数
     "buy_fee_rate": 0.0005,
     "sell_fee_rate": 0.0010,
